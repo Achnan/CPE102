@@ -105,6 +105,29 @@ STOP_DISTANCE = 50          # pixels - drawn "aim" circle radius around a target
 
 
 # ============================================================
+# ESP32 CONNECTION SETTINGS (new - for esp32_link.py)
+# ============================================================
+
+# IP address printed on the ESP32's Serial Monitor after it connects
+# to Wi-Fi ("[WIFI] Connected! IP address: ..."). Update this each
+# time it changes (e.g. router hands out a new DHCP lease).
+ESP32_IP = "192.168.1.50"
+ESP32_PORT = 80
+ESP32_COMMAND_PATH = "/command"
+
+# How long to wait for the ESP32 to respond before giving up on one
+# request. Kept well under the ESP32's own COMMAND_TIMEOUT_MS
+# (1500ms) so a slow/dropped request doesn't stall the vision loop.
+ESP32_REQUEST_TIMEOUT_SECONDS = 0.5
+
+# Don't send a command more often than this, even if main.py's frame
+# rate is much higher - avoids flooding the ESP32's HTTP server.
+# Kept well under the ESP32's 1.5s failsafe timeout so movement
+# commands keep refreshing before it auto-stops.
+MIN_COMMAND_INTERVAL_SECONDS = 0.2
+
+
+# ============================================================
 # AUTO-LOAD TUNED HSV RANGES (from hsv_tuner.py)
 # If hsv_overrides.json exists next to this file, it overrides the
 # built-in COLORS ranges above (box colors stay from COLORS). This

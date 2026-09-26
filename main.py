@@ -1,5 +1,3 @@
-#=======MAIN
-
 import cv2
 
 import config
@@ -7,6 +5,7 @@ import robot_tracker
 import vision
 import navigation
 import drawing
+import esp32_link
 
 
 def main():
@@ -18,6 +17,13 @@ def main():
         return
 
     aruco_detector = robot_tracker.make_detector()
+
+    # Tracks whether the gripper was holding something last frame, so
+    # GRAB/RELEASE only get sent once per pickup/placement — not on
+    # every single frame the robot happens to sit inside the zone.
+    was_holding = False
+    grabbed_this_cycle = False
+    placed_this_cycle = False
 
     while True:
 
@@ -82,6 +88,42 @@ def main():
             f"ready_to_grab: {nav['ready_to_grab']}, ready_to_place: {nav['ready_to_place']})"
         )
 
+        # ========================================================
+        # SEND COMMAND TO ESP32 OVER WI-FI
+        #
+        # GRAB/RELEASE fire once per event (edge-triggered off
+        # ready_to_grab/ready_to_place going True), sent with
+        # force=True so they aren't delayed by the send throttle.
+        # Every other frame just resends the current movement
+        # command (FORWARD/LEFT/RIGHT/STOP) — this is required,
+        # not optional: the ESP32 auto-stops itself if it doesn't
+        # hear ANY command for 1.5 seconds.
+        # ========================================================
+
+        if nav["ready_to_grab"] and not grabbed_this_cycle:
+            esp32_link.send_command("GRAB", force=True)
+            grabbed_this_cycle = True
+
+        elif nav["ready_to_place"] and not placed_this_cycle:
+            esp32_link.send_command("RELEASE", force=True)
+            placed_this_cycle = True
+
+        else:
+            esp32_link.send_command(nav["nav_command"])
+
+        # Reset the one-shot guards when the held/not-held state
+        # actually flips, so the next pickup/placement can trigger
+        # GRAB/RELEASE again.
+        is_holding = held_gem_color is not None
+
+        if is_holding and not was_holding:
+            placed_this_cycle = False   # just picked up - ready to place next
+
+        if not is_holding and was_holding:
+            grabbed_this_cycle = False  # just placed/dropped - ready to grab next
+
+        was_holding = is_holding
+
         # ---- draw field layout ----
         drawing.draw_division_line(result, width, division_y)
         drawing.draw_target_circles(result, target_circles)
@@ -101,6 +143,9 @@ def main():
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+
+    # Make sure the robot doesn't keep driving after the script exits.
+    esp32_link.send_command("STOP", force=True)
 
     cap.release()
     cv2.destroyAllWindows()
