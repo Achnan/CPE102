@@ -208,6 +208,7 @@ def main():
         was_holding = is_holding
 
         # ---- draw field layout ----
+        drawing.draw_field_boundary(result, height, width)
         drawing.draw_division_line(result, width, division_y)
         drawing.draw_target_circles(result, target_circles)
         drawing.draw_field_gems(result, field_gems)

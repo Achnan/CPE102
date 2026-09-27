@@ -1,5 +1,3 @@
-#========VISION
-
 import cv2
 import numpy as np
 
@@ -40,6 +38,39 @@ def clean_mask(mask):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _kernel, iterations=2)
     return mask
+
+
+def get_field_roi_pixels(height, width):
+    """
+    Convert config.FIELD_ROI_*_FRAC (0.0-1.0 fractions) into an actual
+    pixel rectangle (x1, y1, x2, y2) for this frame's size. Clamped and
+    sorted so a slider glitch (e.g. X2 < X1) can't produce a broken
+    rectangle.
+    """
+
+    x1 = int(config.FIELD_ROI_X1_FRAC * width)
+    y1 = int(config.FIELD_ROI_Y1_FRAC * height)
+    x2 = int(config.FIELD_ROI_X2_FRAC * width)
+    y2 = int(config.FIELD_ROI_Y2_FRAC * height)
+
+    x1, x2 = sorted((max(0, min(x1, width)), max(0, min(x2, width))))
+    y1, y2 = sorted((max(0, min(y1, height)), max(0, min(y2, height))))
+
+    return (x1, y1, x2, y2)
+
+
+def apply_field_roi(hsv_image, roi):
+    """
+    Zero out everything OUTSIDE the field boundary rectangle so it can
+    never be detected as a target circle or gem - this is how a wall
+    (or anything else outside the play area) sharing a gem's color
+    gets excluded, even though its HSV values would otherwise match.
+    """
+
+    x1, y1, x2, y2 = roi
+    masked = np.zeros_like(hsv_image)
+    masked[y1:y2, x1:x2] = hsv_image[y1:y2, x1:x2]
+    return masked
 
 
 def sample_color_at(hsv_image, center_x, center_y, radius):
@@ -95,10 +126,17 @@ def detect_target_circles_and_gems(image, hsv_image, robot_roi):
         gems), which are NOT blanked near the robot so a gem next
         to the robot doesn't disappear
 
+    Both passes are first restricted to the field boundary rectangle
+    (config.FIELD_ROI_*_FRAC), so anything outside it - like a wall
+    that happens to share a gem's color - is excluded entirely.
+
     Returns (detected_objects, field_gems) - both lists of dicts.
     """
 
     height, width = image.shape[:2]
+
+    field_roi = get_field_roi_pixels(height, width)
+    hsv_image = apply_field_roi(hsv_image, field_roi)
 
     hsv_for_targets = hsv_image.copy()
     if robot_roi is not None:

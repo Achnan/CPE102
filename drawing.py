@@ -1,4 +1,3 @@
-#========== DRAWING
 import cv2
 
 import config
@@ -30,6 +29,27 @@ def draw_pickup_circle(result, gripper_center):
     gx, gy = int(gripper_center[0]), int(gripper_center[1])
     cv2.circle(result, (gx, gy), config.PICKUP_RADIUS, (255, 0, 255), 2)
     cv2.circle(result, (gx, gy), 4, (255, 0, 255), -1)
+
+
+def draw_field_boundary(result, height, width):
+    """Draw the field boundary rectangle (config.FIELD_ROI_*_FRAC) so
+    it's visible where detection is restricted to - anything outside
+    this box (like a wall) is excluded from color detection."""
+
+    x1, y1, x2, y2 = vision.get_field_roi_pixels(height, width)
+
+    # Only draw it if it's actually restricting something - a
+    # full-frame default (0,0,1,1) would just draw a border around
+    # the whole image, which isn't useful information.
+    is_full_frame = (x1 == 0 and y1 == 0 and x2 == width and y2 == height)
+    if is_full_frame:
+        return
+
+    cv2.rectangle(result, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    cv2.putText(
+        result, "field boundary", (x1 + 5, y1 + 25),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA
+    )
 
 
 def draw_division_line(result, width, division_y):

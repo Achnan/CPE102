@@ -94,6 +94,20 @@ MIN_COMMAND_INTERVAL_SECONDS = 0.2
 
 
 # ============================================================
+# FIELD BOUNDARY (excludes stuff like a wall sharing a gem's color)
+# Stored as FRACTIONS of frame width/height (0.0-1.0), not raw pixels,
+# so it stays valid even if you switch to a different camera
+# resolution. Defaults to the whole frame (no exclusion) until you
+# run field_roi_tuner.py to set it.
+# ============================================================
+
+FIELD_ROI_X1_FRAC = 0.0
+FIELD_ROI_Y1_FRAC = 0.0
+FIELD_ROI_X2_FRAC = 1.0
+FIELD_ROI_Y2_FRAC = 1.0
+
+
+# ============================================================
 # PICKUP / PLACEMENT CIRCLE (in front of the robot)
 # ============================================================
 
@@ -150,6 +164,7 @@ _ROBOT_OVERRIDABLE_NAMES = {
     "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
     "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
     "GEM_COLOR_MIN_RATIO",
+    "FIELD_ROI_X1_FRAC", "FIELD_ROI_Y1_FRAC", "FIELD_ROI_X2_FRAC", "FIELD_ROI_Y2_FRAC",
 }
 
 
