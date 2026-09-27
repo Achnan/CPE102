@@ -107,14 +107,27 @@ def push_esp32_config(values):
 
 
 def save_python_overrides(values):
-    """Save the Python-side (vision/navigation) sliders to robot_overrides.json."""
+    """
+    Save the Python-side (vision/navigation) sliders to
+    robot_overrides.json. Merges with whatever's already in the file
+    rather than overwriting it, since field_roi_tuner.py writes to
+    this same file for the field-boundary settings - overwriting
+    outright would wipe those out.
+    """
 
-    to_save = {}
+    existing = {}
+    if os.path.exists(ROBOT_OVERRIDE_PATH):
+        try:
+            with open(ROBOT_OVERRIDE_PATH, "r") as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
     for label, _lo, _hi, _default, name, scale in PYTHON_SLIDERS:
-        to_save[name] = values[label] / scale
+        existing[name] = values[label] / scale
 
     with open(ROBOT_OVERRIDE_PATH, "w") as f:
-        json.dump(to_save, f, indent=2)
+        json.dump(existing, f, indent=2)
 
     print(f"[robot_config_tuner] Saved Python-side settings to {ROBOT_OVERRIDE_PATH}")
 

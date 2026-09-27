@@ -142,6 +142,19 @@ SIDE_DIVISION = 0.5   # fraction of frame height splitting TOP / BOTTOM
 TURN_ANGLE_THRESHOLD = 15   # degrees - "close enough" to forward
 STOP_DISTANCE = 50          # pixels - drawn "aim" circle radius around a target
 
+# Once the robot commits to chasing a specific gem (or a specific
+# target circle), it keeps chasing THAT one - matched by color + being
+# within this many pixels of where it was last seen - instead of
+# re-picking "whichever is nearest" fresh every frame. Without this,
+# the nearest gem can flip between two candidates as the robot moves,
+# making it constantly re-aim instead of committing to one and
+# finishing the pickup. Only when the locked gem/target can no longer
+# be found nearby (picked up, or a false-positive that vanished) does
+# it pick a new one. Raise this if real detection jitter is causing
+# the lock to break too easily; lower it if it's locking onto the
+# wrong object when two of the same color are close together.
+TARGET_LOCK_MAX_DRIFT_PX = 40
+
 
 # ============================================================
 # AUTO-LOAD TUNED ROBOT SETTINGS (from robot_config_tuner.py)
@@ -163,7 +176,7 @@ _ROBOT_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 _ROBOT_OVERRIDABLE_NAMES = {
     "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
     "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
-    "GEM_COLOR_MIN_RATIO",
+    "GEM_COLOR_MIN_RATIO", "TARGET_LOCK_MAX_DRIFT_PX",
     "FIELD_ROI_X1_FRAC", "FIELD_ROI_Y1_FRAC", "FIELD_ROI_X2_FRAC", "FIELD_ROI_Y2_FRAC",
 }
 
