@@ -2,7 +2,7 @@
 Live HSV Tuner
 ==============
 Run this any time lighting has changed and your color detection looks
-off. Adjust sliders until the MASK window shows clean white blobs where
+off. Adjust sliders until the MASK panel shows clean white blobs where
 your colored objects are (and black everywhere else), then press 's'
 to save. main.py will automatically pick up the saved values next time
 you run it - no code editing required.
@@ -17,6 +17,11 @@ robot's ArUco marker before scanning for TARGET CIRCLES specifically
 robot marker to detect, so it can't preview that blanking - if a
 target circle sits very close to where the robot happens to be
 parked, trust main.py's own display over the tuner for that spot.
+
+Everything lives in ONE window now: color buttons, sliders, the live
+camera feed (with detected blobs outlined), the raw mask, and the
+masked result are all shown together so you never have to hunt for a
+second window.
 
 Controls:
     Click a color button at the top   - pick which color you're tuning
@@ -33,6 +38,7 @@ Controls:
 import copy
 import json
 import os
+import time
 
 import cv2
 import numpy as np
@@ -42,20 +48,39 @@ import vision
 
 OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hsv_overrides.json")
 
-WINDOW_MAIN = "HSV Tuner - camera"
-WINDOW_MASK = "HSV Tuner - mask / result"
+WINDOW_NAME = "HSV Tuner"
 
-BUTTON_ROW_HEIGHT = 44   # pixels reserved at the top of the frame for color buttons
+# ---- layout constants -------------------------------------------------
+BUTTON_ROW_HEIGHT = 46      # color picker buttons across the top
+INFO_BAR_HEIGHT = 46        # selected color / range / HSV values readout
+FOOTER_HEIGHT = 30          # condensed keybinding hints + status message
+PANEL_HEADER_HEIGHT = 22    # "CAMERA" / "MASK" / "RESULT" labels
+PANEL_GAP = 6               # gap between the three panels
+PANEL_WIDTH = 400           # each of the 3 panels is resized to this width
+MARGIN = 8                  # outer margin around the whole canvas
+
+BG_COLOR = (32, 32, 32)
+PANEL_BORDER = (90, 90, 90)
+TEXT_COLOR = (230, 230, 230)
+MUTED_TEXT = (150, 150, 150)
+ACCENT = (60, 200, 255)
+SAVE_FLASH_COLOR = (90, 220, 90)
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def _nothing(_value):
     pass
 
 
-def draw_color_buttons(display, color_names, working, selected_index):
-    """Draw one clickable button per color across the top of `display`."""
+# ------------------------------------------------------------------ #
+# Drawing helpers
+# ------------------------------------------------------------------ #
 
-    width = display.shape[1]
+def draw_color_buttons(canvas, color_names, working, selected_index, hover_index):
+    """Draw one clickable button per color across the top of `canvas`."""
+
+    width = canvas.shape[1]
     btn_w = max(1, width // len(color_names))
 
     for i, name in enumerate(color_names):
@@ -63,25 +88,113 @@ def draw_color_buttons(display, color_names, working, selected_index):
         x2 = width if i == len(color_names) - 1 else x1 + btn_w
         box_color = working[name]["box_color"]
 
-        cv2.rectangle(display, (x1, 0), (x2, BUTTON_ROW_HEIGHT), box_color, -1)
+        is_selected = i == selected_index
+        is_hover = i == hover_index and not is_selected
 
-        # pick readable text color based on button brightness
+        fill = box_color
+        if is_hover:
+            # lighten slightly on hover so it feels responsive
+            fill = tuple(min(255, int(c * 1.25) + 15) for c in box_color)
+
+        cv2.rectangle(canvas, (x1, 0), (x2 - 1, BUTTON_ROW_HEIGHT), fill, -1)
+
         brightness = 0.114 * box_color[0] + 0.587 * box_color[1] + 0.299 * box_color[2]
-        text_color = (255, 255, 255) if brightness < 140 else (0, 0, 0)
+        text_color = (255, 255, 255) if brightness < 140 else (20, 20, 20)
 
-        cv2.putText(
-            display, name, (x1 + 6, BUTTON_ROW_HEIGHT - 14),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2, cv2.LINE_AA
-        )
+        label = name if not is_selected else f"* {name}"
+        (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 2)
+        tx = x1 + max(6, (btn_w - tw) // 2)
+        ty = BUTTON_ROW_HEIGHT // 2 + th // 2
 
-        if i == selected_index:
-            cv2.rectangle(display, (x1, 0), (x2 - 1, BUTTON_ROW_HEIGHT - 1), (255, 255, 255), 3)
+        cv2.putText(canvas, label, (tx, ty), FONT, 0.55, text_color, 2, cv2.LINE_AA)
 
+        # thin separators between buttons
+        if i > 0:
+            cv2.line(canvas, (x1, 0), (x1, BUTTON_ROW_HEIGHT), (0, 0, 0), 1)
+
+        if is_selected:
+            cv2.rectangle(canvas, (x1 + 2, 2), (x2 - 3, BUTTON_ROW_HEIGHT - 3), (255, 255, 255), 2)
+
+    cv2.line(canvas, (0, BUTTON_ROW_HEIGHT), (width, BUTTON_ROW_HEIGHT), (0, 0, 0), 2)
     return btn_w
 
 
+def draw_info_bar(canvas, y0, name, range_index, num_ranges, lower, upper, box_color, hsv_pixel=None):
+    """Readout of the currently selected color/range + swatches for lower/upper."""
+
+    width = canvas.shape[1]
+    y1 = y0 + INFO_BAR_HEIGHT
+    cv2.rectangle(canvas, (0, y0), (width, y1), (48, 48, 48), -1)
+    cv2.line(canvas, (0, y1), (width, y1), (0, 0, 0), 2)
+
+    pad = 10
+    cy = y0 + INFO_BAR_HEIGHT // 2
+
+    # color name swatch + label
+    cv2.rectangle(canvas, (pad, y0 + 10), (pad + 26, y1 - 10), box_color, -1)
+    cv2.rectangle(canvas, (pad, y0 + 10), (pad + 26, y1 - 10), (255, 255, 255), 1)
+
+    title = f"{name}  -  range {range_index + 1}/{num_ranges}"
+    cv2.putText(canvas, title, (pad + 36, cy + 6), FONT, 0.6, TEXT_COLOR, 2, cv2.LINE_AA)
+
+    # HSV lower/upper swatches, right-aligned
+    def hsv_to_bgr(h, s, v):
+        patch = np.uint8([[[h, s, v]]])
+        bgr = cv2.cvtColor(patch, cv2.COLOR_HSV2BGR)[0][0]
+        return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+    swatch_w, swatch_h = 40, 22
+    x = width - pad - swatch_w
+    y = y0 + (INFO_BAR_HEIGHT - swatch_h) // 2
+
+    cv2.rectangle(canvas, (x, y), (x + swatch_w, y + swatch_h), hsv_to_bgr(*upper), -1)
+    cv2.rectangle(canvas, (x, y), (x + swatch_w, y + swatch_h), (255, 255, 255), 1)
+    cv2.putText(canvas, "max", (x, y - 6), FONT, 0.4, MUTED_TEXT, 1, cv2.LINE_AA)
+
+    x -= swatch_w + 14
+    cv2.rectangle(canvas, (x, y), (x + swatch_w, y + swatch_h), hsv_to_bgr(*lower), -1)
+    cv2.rectangle(canvas, (x, y), (x + swatch_w, y + swatch_h), (255, 255, 255), 1)
+    cv2.putText(canvas, "min", (x, y - 6), FONT, 0.4, MUTED_TEXT, 1, cv2.LINE_AA)
+
+    values_text = f"H {lower[0]:3d}-{upper[0]:3d}   S {lower[1]:3d}-{upper[1]:3d}   V {lower[2]:3d}-{upper[2]:3d}"
+    x -= 14
+    (tw, th), _ = cv2.getTextSize(values_text, FONT, 0.5, 1)
+    cv2.putText(canvas, values_text, (x - tw, cy + 5), FONT, 0.5, MUTED_TEXT, 1, cv2.LINE_AA)
+
+
+def make_panel(image, label, target_w, is_mask=False):
+    """Resize `image` to target_w (keeping aspect ratio) and add a header + border."""
+
+    h, w = image.shape[:2]
+    scale = target_w / float(w)
+    target_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    panel = np.zeros((PANEL_HEADER_HEIGHT + target_h, target_w, 3), dtype=np.uint8)
+    panel[:] = (24, 24, 24)
+    panel[PANEL_HEADER_HEIGHT:, :] = resized
+
+    cv2.putText(panel, label, (6, PANEL_HEADER_HEIGHT - 6), FONT, 0.5, ACCENT, 1, cv2.LINE_AA)
+    cv2.rectangle(panel, (0, 0), (target_w - 1, panel.shape[0] - 1), PANEL_BORDER, 1)
+    return panel
+
+
+def draw_footer(canvas, y0, flash_message=None, flash_color=SAVE_FLASH_COLOR):
+    width = canvas.shape[1]
+    y1 = y0 + FOOTER_HEIGHT
+    cv2.rectangle(canvas, (0, y0), (width, y1), (20, 20, 20), -1)
+
+    if flash_message:
+        text, color = flash_message, flash_color
+    else:
+        text = "click/n/p color  |  [ ] range  |  + add range  |  - remove range  |  s save  |  q/ESC quit"
+        color = MUTED_TEXT
+
+    cv2.putText(canvas, text, (10, y0 + FOOTER_HEIGHT - 9), FONT, 0.48, color, 1, cv2.LINE_AA)
+
+
 def button_index_for_click(x, y, width, num_colors):
-    """Return which color button was clicked, or None if the click was elsewhere."""
+    """Return which color button was clicked/hovered, or None if outside the row."""
 
     if y < 0 or y > BUTTON_ROW_HEIGHT:
         return None
@@ -89,6 +202,12 @@ def button_index_for_click(x, y, width, num_colors):
     btn_w = max(1, width // num_colors)
     idx = x // btn_w
     return min(idx, num_colors - 1)
+
+
+def find_detections(mask):
+    """Contours in the cleaned mask, for drawing outlines on the camera panel."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return [c for c in contours if cv2.contourArea(c) > 40]
 
 
 def build_working_copy():
@@ -109,6 +228,10 @@ def save_overrides(working):
     print(f"[hsv_tuner] Saved HSV ranges to {OVERRIDE_PATH}")
 
 
+# ------------------------------------------------------------------ #
+# Main
+# ------------------------------------------------------------------ #
+
 def main():
 
     cap = cv2.VideoCapture(0)
@@ -119,28 +242,45 @@ def main():
     working = build_working_copy()
     color_names = list(working.keys())
 
-    state = {"color_index": 0, "range_index": 0, "frame_width": 640}
+    canvas_width = MARGIN * 2 + PANEL_WIDTH * 3 + PANEL_GAP * 2
 
-    cv2.namedWindow(WINDOW_MAIN)
-    cv2.namedWindow(WINDOW_MASK)
+    state = {
+        "color_index": 0,
+        "range_index": 0,
+        "hover_index": None,
+        "flash_message": None,
+        "flash_until": 0.0,
+        "frame_count": 0,
+        "cached_contours": [],
+    }
+
+    # recomputing contours every single frame is the priciest cosmetic step;
+    # only refresh them every DETECTION_EVERY frames to keep the UI snappy
+    DETECTION_EVERY = 2
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
     def on_mouse(event, x, y, flags, _param):
+        if event == cv2.EVENT_MOUSEMOVE:
+            state["hover_index"] = button_index_for_click(x, y, canvas_width, len(color_names))
+            return
         if event != cv2.EVENT_LBUTTONDOWN:
             return
-        idx = button_index_for_click(x, y, state["frame_width"], len(color_names))
+        idx = button_index_for_click(x, y, canvas_width, len(color_names))
         if idx is not None and idx != state["color_index"]:
             state["color_index"] = idx
             state["range_index"] = 0
             push_sliders_from_state()
 
-    cv2.setMouseCallback(WINDOW_MAIN, on_mouse)
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
-    cv2.createTrackbar("H min", WINDOW_MAIN, 0, 179, _nothing)
-    cv2.createTrackbar("S min", WINDOW_MAIN, 0, 255, _nothing)
-    cv2.createTrackbar("V min", WINDOW_MAIN, 0, 255, _nothing)
-    cv2.createTrackbar("H max", WINDOW_MAIN, 179, 179, _nothing)
-    cv2.createTrackbar("S max", WINDOW_MAIN, 255, 255, _nothing)
-    cv2.createTrackbar("V max", WINDOW_MAIN, 255, 255, _nothing)
+    # sliders grouped as min/max pairs per channel, easier to reason about
+    cv2.createTrackbar("H min", WINDOW_NAME, 0, 179, _nothing)
+    cv2.createTrackbar("H max", WINDOW_NAME, 179, 179, _nothing)
+    cv2.createTrackbar("S min", WINDOW_NAME, 0, 255, _nothing)
+    cv2.createTrackbar("S max", WINDOW_NAME, 255, 255, _nothing)
+    cv2.createTrackbar("V min", WINDOW_NAME, 0, 255, _nothing)
+    cv2.createTrackbar("V max", WINDOW_NAME, 255, 255, _nothing)
 
     def push_sliders_from_state():
         name = color_names[state["color_index"]]
@@ -148,12 +288,12 @@ def main():
         state["range_index"] = min(state["range_index"], len(ranges) - 1)
         lower, upper = ranges[state["range_index"]]
 
-        cv2.setTrackbarPos("H min", WINDOW_MAIN, lower[0])
-        cv2.setTrackbarPos("S min", WINDOW_MAIN, lower[1])
-        cv2.setTrackbarPos("V min", WINDOW_MAIN, lower[2])
-        cv2.setTrackbarPos("H max", WINDOW_MAIN, upper[0])
-        cv2.setTrackbarPos("S max", WINDOW_MAIN, upper[1])
-        cv2.setTrackbarPos("V max", WINDOW_MAIN, upper[2])
+        cv2.setTrackbarPos("H min", WINDOW_NAME, lower[0])
+        cv2.setTrackbarPos("H max", WINDOW_NAME, upper[0])
+        cv2.setTrackbarPos("S min", WINDOW_NAME, lower[1])
+        cv2.setTrackbarPos("S max", WINDOW_NAME, upper[1])
+        cv2.setTrackbarPos("V min", WINDOW_NAME, lower[2])
+        cv2.setTrackbarPos("V max", WINDOW_NAME, upper[2])
 
     push_sliders_from_state()
 
@@ -166,26 +306,23 @@ def main():
             print("Cannot read camera")
             break
 
-        state["frame_width"] = frame.shape[1]
-
         name = color_names[state["color_index"]]
         ranges = working[name]["ranges"]
         box_color = working[name]["box_color"]
 
         # ---- read current slider values back into the working copy ----
-        h_min = cv2.getTrackbarPos("H min", WINDOW_MAIN)
-        s_min = cv2.getTrackbarPos("S min", WINDOW_MAIN)
-        v_min = cv2.getTrackbarPos("V min", WINDOW_MAIN)
-        h_max = cv2.getTrackbarPos("H max", WINDOW_MAIN)
-        s_max = cv2.getTrackbarPos("S max", WINDOW_MAIN)
-        v_max = cv2.getTrackbarPos("V max", WINDOW_MAIN)
+        h_min = cv2.getTrackbarPos("H min", WINDOW_NAME)
+        h_max = cv2.getTrackbarPos("H max", WINDOW_NAME)
+        s_min = cv2.getTrackbarPos("S min", WINDOW_NAME)
+        s_max = cv2.getTrackbarPos("S max", WINDOW_NAME)
+        v_min = cv2.getTrackbarPos("V min", WINDOW_NAME)
+        v_max = cv2.getTrackbarPos("V max", WINDOW_NAME)
 
-        ranges[state["range_index"]] = [[h_min, s_min, v_min], [h_max, s_max, v_max]]
+        lower_hsv = [h_min, s_min, v_min]
+        upper_hsv = [h_max, s_max, v_max]
+        ranges[state["range_index"]] = [lower_hsv, upper_hsv]
 
         # ---- build mask using the SAME pipeline main.py uses ----
-        # (vision.to_hsv applies the same CLAHE brightness normalization,
-        # and clean_mask applies the same open/close cleanup - so what
-        # you see here is what main.py will actually detect.)
         hsv = vision.to_hsv(frame)
 
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -196,24 +333,51 @@ def main():
         result = cv2.bitwise_and(frame, frame, mask=mask)
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
-        # ---- draw clickable color buttons + info text on the main window ----
-        display = frame.copy()
-        draw_color_buttons(display, color_names, working, state["color_index"])
+        # outline detected blobs directly on the camera feed for a quick sanity check.
+        # contour search is the priciest cosmetic step, so only refresh it every
+        # few frames - the sliders/mask themselves still update every frame.
+        state["frame_count"] += 1
+        if state["frame_count"] % DETECTION_EVERY == 0 or not state["cached_contours"]:
+            state["cached_contours"] = find_detections(mask)
 
-        text_top = BUTTON_ROW_HEIGHT + 25
-        info_lines = [
-            f"Color: {name}  (range {state['range_index'] + 1}/{len(ranges)})",
-            f"Lower: {[h_min, s_min, v_min]}   Upper: {[h_max, s_max, v_max]}",
-            "click a button above or n/p to switch color   [ / ] range   + add   - remove   s save   q quit",
+        camera_view = frame.copy()
+        for contour in state["cached_contours"]:
+            cv2.drawContours(camera_view, [contour], -1, box_color, 2)
+
+        # ---- assemble the single combined canvas ----
+        top_h = BUTTON_ROW_HEIGHT + INFO_BAR_HEIGHT
+        panels = [
+            make_panel(camera_view, "CAMERA + DETECTIONS", PANEL_WIDTH),
+            make_panel(mask_bgr, "MASK", PANEL_WIDTH),
+            make_panel(result, "RESULT", PANEL_WIDTH),
         ]
-        for i, line in enumerate(info_lines):
-            cv2.putText(
-                display, line, (10, text_top + i * 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2, cv2.LINE_AA
-            )
+        panel_h = max(p.shape[0] for p in panels)
+        panels = [
+            p if p.shape[0] == panel_h
+            else cv2.copyMakeBorder(p, 0, panel_h - p.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(24, 24, 24))
+            for p in panels
+        ]
 
-        cv2.imshow(WINDOW_MAIN, display)
-        cv2.imshow(WINDOW_MASK, np.hstack([mask_bgr, result]))
+        canvas_h = MARGIN * 2 + top_h + panel_h + FOOTER_HEIGHT
+        canvas = np.zeros((canvas_h, canvas_width, 3), dtype=np.uint8)
+        canvas[:] = BG_COLOR
+
+        draw_color_buttons(canvas, color_names, working, state["color_index"], state["hover_index"])
+        draw_info_bar(canvas, BUTTON_ROW_HEIGHT, name, state["range_index"], len(ranges),
+                      lower_hsv, upper_hsv, box_color)
+
+        x = MARGIN
+        y = top_h + MARGIN
+        for p in panels:
+            canvas[y:y + p.shape[0], x:x + p.shape[1]] = p
+            x += p.shape[1] + PANEL_GAP
+
+        flash = None
+        if state["flash_message"] and time.time() < state["flash_until"]:
+            flash = state["flash_message"]
+        draw_footer(canvas, canvas_h - FOOTER_HEIGHT, flash_message=flash)
+
+        cv2.imshow(WINDOW_NAME, canvas)
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -242,19 +406,27 @@ def main():
             ranges.append(copy.deepcopy(ranges[state["range_index"]]))
             state["range_index"] = len(ranges) - 1
             push_sliders_from_state()
-            print(f"[hsv_tuner] Added range #{len(ranges)} for '{name}'")
+            state["flash_message"] = f"Added range #{len(ranges)} for '{name}'"
+            state["flash_until"] = time.time() + 1.5
+            print(f"[hsv_tuner] {state['flash_message']}")
 
         elif key == ord('-'):
             if len(ranges) > 1:
                 ranges.pop(state["range_index"])
                 state["range_index"] = max(0, state["range_index"] - 1)
                 push_sliders_from_state()
-                print(f"[hsv_tuner] Removed a range for '{name}', {len(ranges)} left")
+                state["flash_message"] = f"Removed a range for '{name}', {len(ranges)} left"
+                state["flash_until"] = time.time() + 1.5
+                print(f"[hsv_tuner] {state['flash_message']}")
             else:
-                print(f"[hsv_tuner] '{name}' must keep at least 1 range")
+                state["flash_message"] = f"'{name}' must keep at least 1 range"
+                state["flash_until"] = time.time() + 1.5
+                print(f"[hsv_tuner] {state['flash_message']}")
 
         elif key == ord('s'):
             save_overrides(working)
+            state["flash_message"] = f"Saved to {os.path.basename(OVERRIDE_PATH)}"
+            state["flash_until"] = time.time() + 1.5
 
     cap.release()
     cv2.destroyAllWindows()

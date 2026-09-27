@@ -48,7 +48,7 @@ COLORS = {
         [
             # Your target: HSV(191°, 45%, 75%)
             # OpenCV approximate center: (95, 115, 191)
-            ((83, 81, 157), (107, 179, 255))
+            ((88, 60, 160), (105, 149, 255))
         ],
         (191, 131, 105)  # Light-blue label/box color in BGR
     ),
@@ -66,6 +66,31 @@ ARUCO_DICT_NAME = "DICT_4X4_50"
 # for TARGET CIRCLES, so the robot body itself is never mistaken
 # for one. Field gems are NOT blanked with this.
 ROBOT_MASK_PADDING = 60
+
+
+# ============================================================
+# ESP32 CONNECTION SETTINGS
+# ============================================================
+
+# EDIT THIS — the ESP32's IP address on your Wi-Fi network. Get it from
+# the Arduino Serial Monitor after the ESP32 connects
+# (look for "[WIFI] Connected! IP address: ...").
+ESP32_IP = "172.20.10.12"
+
+ESP32_PORT = 80
+ESP32_COMMAND_PATH = "/command"
+
+# How long to wait for the ESP32 to respond before giving up on one
+# request. Keep this short - if the ESP32 doesn't answer quickly, it's
+# better to skip and try again next resend than block the loop.
+ESP32_REQUEST_TIMEOUT_SECONDS = 1.0
+
+# esp32_link won't re-send the SAME action more often than this many
+# seconds (unless force=True) - avoids flooding the ESP32 with
+# identical FORWARD/STOP packets every single video frame. Must stay
+# comfortably under the ESP32's own 1.5s auto-stop safety timeout, or
+# the robot will stop itself between resends.
+MIN_COMMAND_INTERVAL_SECONDS = 0.2
 
 
 # ============================================================
@@ -105,26 +130,57 @@ STOP_DISTANCE = 50          # pixels - drawn "aim" circle radius around a target
 
 
 # ============================================================
-# ESP32 CONNECTION SETTINGS (new - for esp32_link.py)
+# AUTO-LOAD TUNED ROBOT SETTINGS (from robot_config_tuner.py)
+# If robot_overrides.json exists next to this file, it overrides the
+# pickup/navigation constants above (GRIPPER_FORWARD_OFFSET,
+# PICKUP_RADIUS, PICKUP_DISTANCE, TURN_ANGLE_THRESHOLD, STOP_DISTANCE,
+# ROBOT_MASK_PADDING, GEM_COLOR_MIN_RATIO). Re-tune any time by running
+# robot_config_tuner.py and pressing 's' - no code editing needed.
 # ============================================================
 
-# IP address printed on the ESP32's Serial Monitor after it connects
-# to Wi-Fi ("[WIFI] Connected! IP address: ..."). Update this each
-# time it changes (e.g. router hands out a new DHCP lease).
-ESP32_IP = "192.168.1.50"
-ESP32_PORT = 80
-ESP32_COMMAND_PATH = "/command"
+import json
+import os
 
-# How long to wait for the ESP32 to respond before giving up on one
-# request. Kept well under the ESP32's own COMMAND_TIMEOUT_MS
-# (1500ms) so a slow/dropped request doesn't stall the vision loop.
-ESP32_REQUEST_TIMEOUT_SECONDS = 0.5
+_ROBOT_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "robot_overrides.json")
 
-# Don't send a command more often than this, even if main.py's frame
-# rate is much higher - avoids flooding the ESP32's HTTP server.
-# Kept well under the ESP32's 1.5s failsafe timeout so movement
-# commands keep refreshing before it auto-stops.
-MIN_COMMAND_INTERVAL_SECONDS = 0.2
+# Only these names can be overridden this way - guards against a typo'd
+# or malicious JSON key silently creating/overwriting an unrelated
+# module attribute.
+_ROBOT_OVERRIDABLE_NAMES = {
+    "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
+    "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
+    "GEM_COLOR_MIN_RATIO",
+}
+
+
+def _load_robot_overrides():
+
+    if not os.path.exists(_ROBOT_OVERRIDE_PATH):
+        return
+
+    try:
+        with open(_ROBOT_OVERRIDE_PATH, "r") as f:
+            overrides = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[config] Warning: could not read {_ROBOT_OVERRIDE_PATH} ({e}); using built-in values.")
+        return
+
+    for name, value in overrides.items():
+
+        if name not in _ROBOT_OVERRIDABLE_NAMES:
+            print(f"[config] Warning: robot_overrides.json has unknown setting '{name}', skipping.")
+            continue
+
+        globals()[name] = value
+
+    # GEM_SAMPLE_RADIUS is derived from PICKUP_RADIUS - keep it in sync
+    # if PICKUP_RADIUS was just overridden.
+    globals()["GEM_SAMPLE_RADIUS"] = globals()["PICKUP_RADIUS"]
+
+    print(f"[config] Loaded tuned robot settings from {_ROBOT_OVERRIDE_PATH}")
+
+
+_load_robot_overrides()
 
 
 # ============================================================
@@ -134,9 +190,6 @@ MIN_COMMAND_INTERVAL_SECONDS = 0.2
 # means you can re-tune colors any day just by running hsv_tuner.py
 # and pressing 's' - no code editing needed, ever.
 # ============================================================
-
-import json
-import os
 
 _OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hsv_overrides.json")
 
