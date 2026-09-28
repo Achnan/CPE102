@@ -1,6 +1,32 @@
+import time
+
 import numpy as np
 
 import config
+
+# ---- anti-oscillation steering (turn overshoot fix) ----------------------
+# The robot's turn speed is fixed, and there is camera + Wi-Fi delay between
+# "decide to stop turning" and "the wheels actually stop", so a plain
+# "turn until the angle is small" overshoots, flips to the other direction,
+# overshoots again... The three settings below damp that out.
+
+# True  = measure the turn angle from the grip spot (what you asked for).
+# False = measure it from the robot center (the point it actually spins
+#         around). Both agree once the robot is lined up, but the grip-spot
+#         angle changes faster while turning, so if it still wobbles, try False.
+STEER_FROM_GRIPPER = True
+
+# Turning is done in short pulses (turn a little, STOP, let the camera catch
+# up, re-measure). The pulse gets longer the bigger the angle error is:
+TURN_PULSE_PERIOD_SEC = 0.30   # one "turn + pause" cycle
+MIN_TURN_DUTY = 0.30           # smallest fraction of the cycle spent turning
+FULL_TURN_ANGLE = 50.0         # at this error (deg) or more: turn continuously
+
+# Once it is driving FORWARD, only start turning again if the error grows
+# past TURN_ANGLE_THRESHOLD * this factor (stops FORWARD <-> turn flicker).
+FORWARD_RELEASE_FACTOR = 1.5
+
+_steer = {"forwarding": False}
 
 
 def _angle_diff(angle_to_target, heading_deg):
@@ -61,13 +87,15 @@ def _find_locked_match(items, color, x, y):
     return best
 
 
-def _nearest(items, robot_center):
+def _nearest(items, origin):
+    """Item closest to `origin` (now the GRIP SPOT, not the robot center)."""
+
     nearest_item = None
     nearest_distance = None
 
     for item in items:
-        dx = item["center_x"] - robot_center[0]
-        dy = item["center_y"] - robot_center[1]
+        dx = item["center_x"] - origin[0]
+        dy = item["center_y"] - origin[1]
         distance = np.sqrt(dx * dx + dy * dy)
 
         if nearest_distance is None or distance < nearest_distance:
@@ -86,6 +114,12 @@ def compute_navigation(robot_center, robot_heading_deg, gripper_center,
       that gem is inside the pickup circle.
     - If holding a gem: aim at the target circle matching
       held_gem_color. STOP + ready_to_place once inside the pickup circle.
+
+    AIM POINT: everything is measured from the GRIP SPOT
+    (gripper_center), not the ArUco/robot center - the turn angle, and
+    which gem/target counts as "nearest". So the robot lines up its
+    claw with the target, not its body. (robot_center is still needed
+    to know the robot was detected at all.)
 
     TARGET LOCKING: rather than picking "whichever is nearest" fresh
     every frame (which can flip back and forth between two similarly-
@@ -113,6 +147,7 @@ def compute_navigation(robot_center, robot_heading_deg, gripper_center,
     }
 
     if robot_center is None or gripper_center is None:
+        _steer["forwarding"] = False
         return nav
 
     if held_gem_color is None:
@@ -131,7 +166,7 @@ def compute_navigation(robot_center, robot_heading_deg, gripper_center,
             # No valid lock yet, or the locked gem is gone - pick a
             # fresh nearest one and start a new lock.
             _clear_lock()
-            chosen = _nearest(field_gems, robot_center)
+            chosen = _nearest(field_gems, gripper_center)
             if chosen is not None:
                 _set_lock("gem", chosen)
 
@@ -156,8 +191,8 @@ def compute_navigation(robot_center, robot_heading_deg, gripper_center,
             if matching:
                 chosen = min(
                     matching,
-                    key=lambda t: (t["center_x"] - robot_center[0]) ** 2
-                    + (t["center_y"] - robot_center[1]) ** 2
+                    key=lambda t: (t["center_x"] - gripper_center[0]) ** 2
+                    + (t["center_y"] - gripper_center[1]) ** 2
                 )
                 _set_lock("target", chosen)
 
@@ -166,12 +201,16 @@ def compute_navigation(robot_center, robot_heading_deg, gripper_center,
             nav["nav_target_label"] = f"target {chosen['target_index']}:{chosen['color']}"
 
     if nav["nav_target_point"] is None:
+        _steer["forwarding"] = False
         return nav
 
     tx, ty = nav["nav_target_point"]
 
+    # Angle to the target, measured from the grip spot (or the robot center
+    # if STEER_FROM_GRIPPER is False - see the constants at the top).
+    aim_origin = gripper_center if STEER_FROM_GRIPPER else robot_center
     angle_to_target = np.degrees(
-        np.arctan2(ty - robot_center[1], tx - robot_center[0])
+        np.arctan2(ty - aim_origin[1], tx - aim_origin[0])
     )
     angle_diff = _angle_diff(angle_to_target, robot_heading_deg)
     nav["angle_diff"] = angle_diff
@@ -189,43 +228,29 @@ def compute_navigation(robot_center, robot_heading_deg, gripper_center,
         nav["ready_to_place"] = in_pickup_zone
 
     if in_pickup_zone:
+        _steer["forwarding"] = False
         nav["nav_command"] = "STOP"
-    elif angle_diff > config.TURN_ANGLE_THRESHOLD:
-        nav["nav_command"] = "RIGHT"
-    elif angle_diff < -config.TURN_ANGLE_THRESHOLD:
-        nav["nav_command"] = "LEFT"
-    else:
+        return nav
+
+    # Hysteresis: it takes a bigger error to LEAVE forward than to enter it.
+    threshold = config.TURN_ANGLE_THRESHOLD
+    if _steer["forwarding"]:
+        threshold *= FORWARD_RELEASE_FACTOR
+
+    if abs(angle_diff) <= threshold:
+        _steer["forwarding"] = True
         nav["nav_command"] = "FORWARD"
+        return nav
 
-    return nav
+    _steer["forwarding"] = False
+    direction = "RIGHT" if angle_diff > 0 else "LEFT"
 
-    tx, ty = nav["nav_target_point"]
-
-    angle_to_target = np.degrees(
-        np.arctan2(ty - robot_center[1], tx - robot_center[0])
-    )
-    angle_diff = _angle_diff(angle_to_target, robot_heading_deg)
-    nav["angle_diff"] = angle_diff
-
-    gdx = tx - gripper_center[0]
-    gdy = ty - gripper_center[1]
-    gripper_distance = np.sqrt(gdx * gdx + gdy * gdy)
-    nav["gripper_distance"] = gripper_distance
-
-    in_pickup_zone = gripper_distance <= config.PICKUP_DISTANCE
-
-    if held_gem_color is None:
-        nav["ready_to_grab"] = in_pickup_zone
+    # Pulsed turning: small error -> short pulse, big error -> continuous.
+    duty = min(1.0, max(MIN_TURN_DUTY, abs(angle_diff) / FULL_TURN_ANGLE))
+    if duty >= 0.99:
+        nav["nav_command"] = direction
     else:
-        nav["ready_to_place"] = in_pickup_zone
-
-    if in_pickup_zone:
-        nav["nav_command"] = "STOP"
-    elif angle_diff > config.TURN_ANGLE_THRESHOLD:
-        nav["nav_command"] = "RIGHT"
-    elif angle_diff < -config.TURN_ANGLE_THRESHOLD:
-        nav["nav_command"] = "LEFT"
-    else:
-        nav["nav_command"] = "FORWARD"
+        phase = time.monotonic() % TURN_PULSE_PERIOD_SEC
+        nav["nav_command"] = direction if phase < duty * TURN_PULSE_PERIOD_SEC else "STOP"
 
     return nav

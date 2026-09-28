@@ -10,6 +10,7 @@ import vision
 import navigation
 import drawing
 import esp32_link
+from target_memory import TargetMemory   # NEW: makes the base circles sticky
 
 
 # How often prints. Printing every frame adds real per-frame cost for
@@ -57,6 +58,7 @@ class CommandSender:
 
     def _run(self):
         last_sent = 0.0
+        last_command = None
         while self._running:
             try:
                 command = self._priority_queue.get(timeout=0.02)
@@ -67,9 +69,18 @@ class CommandSender:
                 pass
 
             now = time.monotonic()
-            if now - last_sent >= self._resend_interval:
-                with self._lock:
-                    command = self._current_command
+            with self._lock:
+                command = self._current_command
+
+            if command != last_command:
+                # The command just CHANGED (e.g. LEFT -> STOP): send it right
+                # away instead of waiting for the next resend tick. Waiting
+                # up to RESEND_INTERVAL_SEC made the robot keep turning
+                # after the camera said stop, which caused overshoot.
+                esp32_link.send_command(command, force=True)
+                last_command = command
+                last_sent = now
+            elif now - last_sent >= self._resend_interval:
                 esp32_link.send_command(command)
                 last_sent = now
 
@@ -92,6 +103,12 @@ def main():
 
     aruco_detector = robot_tracker.make_detector()
     sender = CommandSender()
+
+    # NEW: remembers each color base by position and locks it in place
+    # once seen long enough, so the robot driving on top of a base (and
+    # blocking the camera's view of it) doesn't make it disappear.
+    # Press 't' in the video window to forget them and re-detect.
+    target_memory = TargetMemory()
 
     # Tracks whether the gripper was holding something last frame, so
     # GRAB/RELEASE only get sent once per pickup/placement — not on
@@ -130,7 +147,18 @@ def main():
             image, hsv_image, robot_info["roi"]
         )
 
-        target_circles, division_y = vision.assign_target_indices(detected_objects, height)
+        # NEW: swap this frame's raw detections for the remembered set
+        # (locked bases stay put even when hidden under the robot).
+        # This MUST come before assign_target_indices, which numbers the
+        # bases left->right - otherwise a hidden base would shift the
+        # numbering of the others.
+        detected_objects = target_memory.update(detected_objects)
+
+        target_circles, _division_y = vision.assign_target_indices(detected_objects, height)
+
+        # NEW: a gem sitting inside a base is not a target to pick up
+        # (e.g. one the robot already placed there).
+        field_gems, ignored_gems = vision.split_gems_by_targets(field_gems, target_circles)
 
         # ---- held gem color, sampled from the pickup circle ----
         held_gem_color = None
@@ -208,26 +236,36 @@ def main():
         was_holding = is_holding
 
         # ---- draw field layout ----
+        # (the white center division line is no longer drawn)
         drawing.draw_field_boundary(result, height, width)
-        drawing.draw_division_line(result, width, division_y)
         drawing.draw_target_circles(result, target_circles)
         drawing.draw_field_gems(result, field_gems)
+        drawing.draw_ignored_gems(result, ignored_gems)
 
         if should_log:
             for obj in target_circles:
                 side = vision.get_side(obj["target_index"])
-                print(f"target {obj['target_index']} ({side}) -> {obj['color']}")
+                lock_note = "locked" if obj.get("locked") else "locking..."
+                print(f"target {obj['target_index']} ({side}) -> {obj['color']} [{lock_note}]")
             print()
 
             for gem in field_gems:
                 print(f"gem -> {gem['color']} at ({gem['center_x']}, {gem['center_y']})")
+            if ignored_gems:
+                print(f"ignored {len(ignored_gems)} gem(s) sitting on a base")
             print()
 
         # ---- display ----
         cv2.imshow("Overview Camera - Target Circles", result)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
             break
+
+        elif key == ord("t"):
+            target_memory.reset()
+            print("[main] Target memory cleared - re-detecting bases.")
 
     # Make sure the robot doesn't keep driving after the script exits.
     sender.stop(final_command="STOP")

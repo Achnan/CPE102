@@ -23,6 +23,23 @@ camera feed (with detected blobs outlined), the raw mask, and the
 masked result are all shown together so you never have to hunt for a
 second window.
 
+EYEDROPPER (new): instead of guessing slider values, pick the color
+straight from the camera image:
+    1. Click a color button (e.g. red) to choose which color you're setting.
+    2. Press 'e' to turn the eyedropper ON.
+    3. Click on the object in the CAMERA panel. The HSV range for that
+       color is set automatically (and the sliders jump to it).
+    4. Click more spots on the same kind of object (bright side, shadow
+       side...) and the range WIDENS to cover all of them.
+    5. Fine-tune with the sliders as usual, or change the two "Pick tol"
+       sliders (how much room to add around what you clicked) - the next
+       click re-applies with the new tolerance.
+Reds that wrap around the hue seam (0/179) are handled for you: the
+eyedropper creates two ranges automatically when needed.
+Note: an eyedropper click REPLACES all ranges of the selected color
+(it recalculates from your clicked samples). Slider tweaks made after
+a click are kept until your next click.
+
 Controls:
     Click a color button at the top   - pick which color you're tuning
     n / p                             - same thing, next / previous color
@@ -31,6 +48,9 @@ Controls:
                                          (e.g. "red" wraps around 0/179, so it needs 2)
     +                                 - add a new range to the current color (clone current)
     -                                 - remove the current range (only if more than 1 left)
+    e                                 - eyedropper on / off (click the CAMERA panel to sample)
+    u                                 - eyedropper: undo the last click
+    r                                 - eyedropper: forget all clicks (next click starts fresh)
     s                                 - save ALL colors' current ranges to hsv_overrides.json
     q / ESC                           - quit without saving further changes
 """
@@ -68,9 +88,103 @@ SAVE_FLASH_COLOR = (90, 220, 90)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+# ---- eyedropper settings ---------------------------------------------
+SAMPLE_RADIUS = 4           # each click averages a (2*4+1)=9x9 pixel patch
+DEFAULT_TOL_H = 10          # hue room added either side of what you clicked
+DEFAULT_TOL_SV = 50         # saturation/value room added either side
+
 
 def _nothing(_value):
     pass
+
+
+# ------------------------------------------------------------------ #
+# Eyedropper helpers
+# ------------------------------------------------------------------ #
+
+def sample_hsv(hsv, cx, cy, radius=SAMPLE_RADIUS):
+    """
+    Median (H, S, V) of a small patch around (cx, cy), taken from the
+    SAME hsv image the detection uses (blur + CLAHE), so the range it
+    produces matches what main.py will actually see.
+
+    Hue is a circle (0 and 179 are neighbours), so a plain median of a
+    red patch could land on a nonsense value like 90. Hues are measured
+    relative to the clicked pixel first, then the median is taken.
+    """
+
+    h_img, w_img = hsv.shape[:2]
+    cx = min(max(cx, 0), w_img - 1)
+    cy = min(max(cy, 0), h_img - 1)
+
+    x1, x2 = max(0, cx - radius), min(w_img, cx + radius + 1)
+    y1, y2 = max(0, cy - radius), min(h_img, cy + radius + 1)
+
+    patch = hsv[y1:y2, x1:x2].reshape(-1, 3).astype(int)
+    if patch.size == 0:
+        return None
+
+    ref = int(hsv[cy, cx][0])
+    hue_diff = ((patch[:, 0] - ref + 90) % 180) - 90
+    h = int(round(ref + np.median(hue_diff))) % 180
+    s = int(np.median(patch[:, 1]))
+    v = int(np.median(patch[:, 2]))
+    return h, s, v
+
+
+def hue_arc(hues):
+    """
+    Smallest arc of the 0-179 hue circle that contains every hue in
+    `hues`, as (start, end). If start > end the arc wraps across 0/179.
+    """
+
+    hs = sorted(set(hues))
+    n = len(hs)
+    if n == 1:
+        return hs[0], hs[0]
+
+    best_gap, best_i = -1, 0
+    for i in range(n):
+        gap = (hs[(i + 1) % n] - hs[i]) % 180
+        if gap > best_gap:
+            best_gap, best_i = gap, i
+
+    return hs[(best_i + 1) % n], hs[best_i]
+
+
+def hue_ranges(start, end, tol):
+    """
+    Turn an arc + tolerance into 1 or 2 plain (lo, hi) hue ranges within
+    0-179. Two ranges come back when the arc crosses the 0/179 seam
+    (typical for red), because cv2.inRange can't wrap around by itself.
+    """
+
+    span = ((end - start) % 180) + 2 * tol
+    if span >= 179:
+        return [(0, 179)]
+
+    lo = (start - tol) % 180
+    hi = lo + span
+
+    if hi <= 179:
+        return [(lo, hi)]
+    return [(lo, 179), (0, hi - 180)]
+
+
+def ranges_from_samples(samples, tol_h, tol_sv):
+    """List of [[h,s,v]_lower, [h,s,v]_upper] built from all clicked samples."""
+
+    start, end = hue_arc([s[0] for s in samples])
+
+    s_lo = max(0, min(s[1] for s in samples) - tol_sv)
+    s_hi = min(255, max(s[1] for s in samples) + tol_sv)
+    v_lo = max(0, min(s[2] for s in samples) - tol_sv)
+    v_hi = min(255, max(s[2] for s in samples) + tol_sv)
+
+    return [
+        [[int(h_lo), int(s_lo), int(v_lo)], [int(h_hi), int(s_hi), int(v_hi)]]
+        for h_lo, h_hi in hue_ranges(start, end, tol_h)
+    ]
 
 
 # ------------------------------------------------------------------ #
@@ -162,7 +276,7 @@ def draw_info_bar(canvas, y0, name, range_index, num_ranges, lower, upper, box_c
     cv2.putText(canvas, values_text, (x - tw, cy + 5), FONT, 0.5, MUTED_TEXT, 1, cv2.LINE_AA)
 
 
-def make_panel(image, label, target_w, is_mask=False):
+def make_panel(image, label, target_w, is_mask=False, label_color=ACCENT):
     """Resize `image` to target_w (keeping aspect ratio) and add a header + border."""
 
     h, w = image.shape[:2]
@@ -174,7 +288,7 @@ def make_panel(image, label, target_w, is_mask=False):
     panel[:] = (24, 24, 24)
     panel[PANEL_HEADER_HEIGHT:, :] = resized
 
-    cv2.putText(panel, label, (6, PANEL_HEADER_HEIGHT - 6), FONT, 0.5, ACCENT, 1, cv2.LINE_AA)
+    cv2.putText(panel, label, (6, PANEL_HEADER_HEIGHT - 6), FONT, 0.5, label_color, 1, cv2.LINE_AA)
     cv2.rectangle(panel, (0, 0), (target_w - 1, panel.shape[0] - 1), PANEL_BORDER, 1)
     return panel
 
@@ -187,7 +301,7 @@ def draw_footer(canvas, y0, flash_message=None, flash_color=SAVE_FLASH_COLOR):
     if flash_message:
         text, color = flash_message, flash_color
     else:
-        text = "click/n/p color  |  [ ] range  |  + add range  |  - remove range  |  s save  |  q/ESC quit"
+        text = "click/n/p color | [ ] range | + / - add/remove range | e eyedropper | s save | q quit"
         color = MUTED_TEXT
 
     cv2.putText(canvas, text, (10, y0 + FOOTER_HEIGHT - 9), FONT, 0.48, color, 1, cv2.LINE_AA)
@@ -252,6 +366,12 @@ def main():
         "flash_until": 0.0,
         "frame_count": 0,
         "cached_contours": [],
+        # eyedropper
+        "eyedropper": False,
+        "samples": [],           # (h, s, v) of every click for the selected color
+        "sample_points": [],     # (x, y) in camera-frame pixels, for the on-screen markers
+        "last_hsv": None,        # the latest frame's HSV image (what clicks sample from)
+        "camera_panel": None,    # (canvas_x, canvas_y, scale) of the camera panel, for click mapping
     }
 
     # recomputing contours every single frame is the priciest cosmetic step;
@@ -260,17 +380,72 @@ def main():
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
+    def flash(text, seconds=1.5):
+        state["flash_message"] = text
+        state["flash_until"] = time.time() + seconds
+
+    def reset_samples():
+        state["samples"] = []
+        state["sample_points"] = []
+
+    def apply_samples():
+        """Recompute the selected color's ranges from ALL clicked samples."""
+        name = color_names[state["color_index"]]
+
+        if not state["samples"]:
+            return
+
+        tol_h = cv2.getTrackbarPos("Pick tol H", WINDOW_NAME)
+        tol_sv = cv2.getTrackbarPos("Pick tol SV", WINDOW_NAME)
+
+        working[name]["ranges"] = ranges_from_samples(state["samples"], tol_h, tol_sv)
+        state["range_index"] = 0
+        push_sliders_from_state()
+
+        n = len(state["samples"])
+        extra = " (wraps 0/179 - 2 ranges)" if len(working[name]["ranges"]) > 1 else ""
+        flash(f"Eyedropper: '{name}' set from {n} click{'s' if n != 1 else ''}{extra}")
+
+    def eyedropper_click(x, y):
+        hsv = state["last_hsv"]
+        layout = state["camera_panel"]
+        if hsv is None or layout is None:
+            return
+
+        x0, y0, scale = layout
+        fx = int((x - x0) / scale)
+        fy = int((y - y0) / scale)
+
+        h_img, w_img = hsv.shape[:2]
+        if not (0 <= fx < w_img and 0 <= fy < h_img):
+            return   # clicked outside the camera picture
+
+        sample = sample_hsv(hsv, fx, fy)
+        if sample is None:
+            return
+
+        state["samples"].append(sample)
+        state["sample_points"].append((fx, fy))
+        apply_samples()
+
     def on_mouse(event, x, y, flags, _param):
         if event == cv2.EVENT_MOUSEMOVE:
             state["hover_index"] = button_index_for_click(x, y, canvas_width, len(color_names))
             return
         if event != cv2.EVENT_LBUTTONDOWN:
             return
+
         idx = button_index_for_click(x, y, canvas_width, len(color_names))
-        if idx is not None and idx != state["color_index"]:
-            state["color_index"] = idx
-            state["range_index"] = 0
-            push_sliders_from_state()
+        if idx is not None:
+            if idx != state["color_index"]:
+                state["color_index"] = idx
+                state["range_index"] = 0
+                reset_samples()
+                push_sliders_from_state()
+            return
+
+        if state["eyedropper"]:
+            eyedropper_click(x, y)
 
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
@@ -281,6 +456,10 @@ def main():
     cv2.createTrackbar("S max", WINDOW_NAME, 255, 255, _nothing)
     cv2.createTrackbar("V min", WINDOW_NAME, 0, 255, _nothing)
     cv2.createTrackbar("V max", WINDOW_NAME, 255, 255, _nothing)
+
+    # eyedropper tolerance: how much room to add around the clicked color
+    cv2.createTrackbar("Pick tol H", WINDOW_NAME, DEFAULT_TOL_H, 40, _nothing)
+    cv2.createTrackbar("Pick tol SV", WINDOW_NAME, DEFAULT_TOL_SV, 120, _nothing)
 
     def push_sliders_from_state():
         name = color_names[state["color_index"]]
@@ -324,6 +503,7 @@ def main():
 
         # ---- build mask using the SAME pipeline main.py uses ----
         hsv = vision.to_hsv(frame)
+        state["last_hsv"] = hsv   # eyedropper clicks sample from this
 
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for lower, upper in ranges:
@@ -344,10 +524,22 @@ def main():
         for contour in state["cached_contours"]:
             cv2.drawContours(camera_view, [contour], -1, box_color, 2)
 
+        # markers where the eyedropper was clicked
+        for i, (px, py) in enumerate(state["sample_points"], start=1):
+            cv2.circle(camera_view, (px, py), SAMPLE_RADIUS + 4, (255, 255, 255), 2)
+            cv2.circle(camera_view, (px, py), SAMPLE_RADIUS + 4, (0, 0, 0), 1)
+            cv2.putText(camera_view, str(i), (px + 10, py - 8), FONT, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+
         # ---- assemble the single combined canvas ----
         top_h = BUTTON_ROW_HEIGHT + INFO_BAR_HEIGHT
+
+        if state["eyedropper"]:
+            camera_label, camera_label_color = "CAMERA - EYEDROPPER ON: click the object", (0, 255, 0)
+        else:
+            camera_label, camera_label_color = "CAMERA + DETECTIONS", ACCENT
+
         panels = [
-            make_panel(camera_view, "CAMERA + DETECTIONS", PANEL_WIDTH),
+            make_panel(camera_view, camera_label, PANEL_WIDTH, label_color=camera_label_color),
             make_panel(mask_bgr, "MASK", PANEL_WIDTH),
             make_panel(result, "RESULT", PANEL_WIDTH),
         ]
@@ -357,6 +549,14 @@ def main():
             else cv2.copyMakeBorder(p, 0, panel_h - p.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(24, 24, 24))
             for p in panels
         ]
+
+        # remember where the camera picture sits on the canvas, so a mouse
+        # click can be mapped back to a pixel of the real camera frame
+        state["camera_panel"] = (
+            MARGIN,
+            top_h + MARGIN + PANEL_HEADER_HEIGHT,
+            PANEL_WIDTH / float(frame.shape[1]),
+        )
 
         canvas_h = MARGIN * 2 + top_h + panel_h + FOOTER_HEIGHT
         canvas = np.zeros((canvas_h, canvas_width, 3), dtype=np.uint8)
@@ -372,10 +572,17 @@ def main():
             canvas[y:y + p.shape[0], x:x + p.shape[1]] = p
             x += p.shape[1] + PANEL_GAP
 
-        flash = None
+        footer_message, footer_color = None, SAVE_FLASH_COLOR
         if state["flash_message"] and time.time() < state["flash_until"]:
-            flash = state["flash_message"]
-        draw_footer(canvas, canvas_h - FOOTER_HEIGHT, flash_message=flash)
+            footer_message = state["flash_message"]
+        elif state["eyedropper"]:
+            n = len(state["samples"])
+            footer_message = (
+                f"EYEDROPPER: click '{name}' on the CAMERA panel ({n} click{'s' if n != 1 else ''}) "
+                f"- more clicks widen | u undo | r restart | e off"
+            )
+            footer_color = ACCENT
+        draw_footer(canvas, canvas_h - FOOTER_HEIGHT, flash_message=footer_message, flash_color=footer_color)
 
         cv2.imshow(WINDOW_NAME, canvas)
 
@@ -387,11 +594,13 @@ def main():
         elif key == ord('n'):
             state["color_index"] = (state["color_index"] + 1) % len(color_names)
             state["range_index"] = 0
+            reset_samples()
             push_sliders_from_state()
 
         elif key == ord('p'):
             state["color_index"] = (state["color_index"] - 1) % len(color_names)
             state["range_index"] = 0
+            reset_samples()
             push_sliders_from_state()
 
         elif key == ord('['):
@@ -406,8 +615,7 @@ def main():
             ranges.append(copy.deepcopy(ranges[state["range_index"]]))
             state["range_index"] = len(ranges) - 1
             push_sliders_from_state()
-            state["flash_message"] = f"Added range #{len(ranges)} for '{name}'"
-            state["flash_until"] = time.time() + 1.5
+            flash(f"Added range #{len(ranges)} for '{name}'")
             print(f"[hsv_tuner] {state['flash_message']}")
 
         elif key == ord('-'):
@@ -415,18 +623,37 @@ def main():
                 ranges.pop(state["range_index"])
                 state["range_index"] = max(0, state["range_index"] - 1)
                 push_sliders_from_state()
-                state["flash_message"] = f"Removed a range for '{name}', {len(ranges)} left"
-                state["flash_until"] = time.time() + 1.5
+                flash(f"Removed a range for '{name}', {len(ranges)} left")
                 print(f"[hsv_tuner] {state['flash_message']}")
             else:
-                state["flash_message"] = f"'{name}' must keep at least 1 range"
-                state["flash_until"] = time.time() + 1.5
+                flash(f"'{name}' must keep at least 1 range")
                 print(f"[hsv_tuner] {state['flash_message']}")
+
+        elif key == ord('e'):
+            state["eyedropper"] = not state["eyedropper"]
+            if state["eyedropper"]:
+                reset_samples()   # a fresh session starts from the next click
+            flash("Eyedropper ON - click the object in the CAMERA panel"
+                  if state["eyedropper"] else "Eyedropper OFF")
+
+        elif key == ord('u'):
+            if state["samples"]:
+                state["samples"].pop()
+                state["sample_points"].pop()
+                if state["samples"]:
+                    apply_samples()
+                else:
+                    flash("Eyedropper: all clicks undone (range unchanged)")
+            else:
+                flash("Eyedropper: nothing to undo")
+
+        elif key == ord('r'):
+            reset_samples()
+            flash("Eyedropper: clicks cleared - next click starts fresh")
 
         elif key == ord('s'):
             save_overrides(working)
-            state["flash_message"] = f"Saved to {os.path.basename(OVERRIDE_PATH)}"
-            state["flash_until"] = time.time() + 1.5
+            flash(f"Saved to {os.path.basename(OVERRIDE_PATH)}")
 
     cap.release()
     cv2.destroyAllWindows()

@@ -32,9 +32,23 @@ def draw_pickup_circle(result, gripper_center):
 
 
 def draw_field_boundary(result, height, width):
-    """Draw the field boundary rectangle (config.FIELD_ROI_*_FRAC) so
-    it's visible where detection is restricted to - anything outside
-    this box (like a wall) is excluded from color detection."""
+    """Draw the field area so it's visible where detection is
+    restricted to - anything outside it (like a wall) is excluded from
+    color detection.
+
+    Uses the click-point polygon from field_roi_tuner.py if one is
+    saved; otherwise falls back to the old rectangle
+    (config.FIELD_ROI_*_FRAC)."""
+
+    polygon = vision.get_field_polygon_pixels(height, width)
+
+    if polygon is not None:
+        cv2.polylines(result, [polygon], True, (0, 255, 255), 2)
+        cv2.putText(
+            result, "field boundary", (int(polygon[:, 0].min()) + 5, int(polygon[:, 1].min()) + 25),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA
+        )
+        return
 
     x1, y1, x2, y2 = vision.get_field_roi_pixels(height, width)
 
@@ -52,17 +66,33 @@ def draw_field_boundary(result, height, width):
     )
 
 
-def draw_division_line(result, width, division_y):
-    cv2.line(result, (0, division_y), (width, division_y), (255, 255, 255), 2)
+# NOTE: draw_division_line() has been removed (the white line across the
+# middle of the frame). Delete any call to it in main.py.
 
 
 def draw_target_circles(result, target_circles):
+    """Draws each color base as a CIRCLE (instead of a box).
+
+    The circle is centered on the base's bounding box, with a radius
+    that fits it. Works best with target_memory.TargetMemory.update()
+    applied first, so a base stays drawn (locked in place) even while
+    the robot is on top of it and blocking the camera's view.
+    """
+
     for obj in target_circles:
         box_color = obj["box_color"]
-        cv2.rectangle(result, (obj["x1"], obj["y1"]), (obj["x2"], obj["y2"]), box_color, 3)
+
+        cx = int((obj["x1"] + obj["x2"]) / 2)
+        cy = int((obj["y1"] + obj["y2"]) / 2)
+        width = obj["x2"] - obj["x1"]
+        height = obj["y2"] - obj["y1"]
+        radius = max(1, int((width + height) / 4))
+
+        cv2.circle(result, (cx, cy), radius, box_color, 3)
+
         cv2.putText(
             result, f"{obj['target_index']}: {obj['color']}",
-            (obj["x1"], max(30, obj["y1"] - 10)),
+            (cx - radius, max(30, cy - radius - 10)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2, cv2.LINE_AA
         )
 
@@ -72,6 +102,19 @@ def draw_field_gems(result, field_gems):
         box_color = gem["box_color"]
         cv2.rectangle(result, (gem["x1"], gem["y1"]), (gem["x2"], gem["y2"]), box_color, 2)
         cv2.circle(result, (gem["center_x"], gem["center_y"]), 4, box_color, -1)
+
+
+def draw_ignored_gems(result, ignored_gems):
+    """Gems that were detected but IGNORED because they sit on a base.
+    Drawn gray so you can see what was rejected (and why the robot isn't
+    chasing it)."""
+
+    for gem in ignored_gems:
+        cv2.rectangle(result, (gem["x1"], gem["y1"]), (gem["x2"], gem["y2"]), (150, 150, 150), 1)
+        cv2.putText(
+            result, "ignored", (gem["x1"], max(12, gem["y1"] - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA
+        )
 
 
 def draw_navigation(result, robot_center, gripper_center, held_gem_color, nav):
@@ -97,8 +140,9 @@ def draw_navigation(result, robot_center, gripper_center, held_gem_color, nav):
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2, cv2.LINE_AA
     )
 
+    # aim line starts at the GRIP SPOT (the point navigation now steers from)
     cv2.line(
-        result, tuple(robot_center.astype(int)), (int(tx), int(ty)),
+        result, (int(gripper_center[0]), int(gripper_center[1])), (int(tx), int(ty)),
         (0, 255, 255), 2
     )
 

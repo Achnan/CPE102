@@ -75,7 +75,7 @@ ROBOT_MASK_PADDING = 60
 # EDIT THIS — the ESP32's IP address on your Wi-Fi network. Get it from
 # the Arduino Serial Monitor after the ESP32 connects
 # (look for "[WIFI] Connected! IP address: ...").
-ESP32_IP = "172.20.10.12"
+ESP32_IP = "10.57.103.178"
 
 ESP32_PORT = 80
 ESP32_COMMAND_PATH = "/command"
@@ -193,11 +193,26 @@ def _load_robot_overrides():
         print(f"[config] Warning: could not read {_ROBOT_OVERRIDE_PATH} ({e}); using built-in values.")
         return
 
+    # These must stay integers - cv2 drawing calls (circle radius, box
+    # padding, etc.) require an int and crash on a float. Python's `/`
+    # division always returns a float even when dividing by 1 (e.g.
+    # 30 / 1 == 30.0), so a saved override can end up as a float even
+    # though the built-in default is an int - cast these back
+    # explicitly regardless of what the JSON actually contained.
+    _INT_NAMES = {
+        "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
+        "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
+        "TARGET_LOCK_MAX_DRIFT_PX",
+    }
+
     for name, value in overrides.items():
 
         if name not in _ROBOT_OVERRIDABLE_NAMES:
             print(f"[config] Warning: robot_overrides.json has unknown setting '{name}', skipping.")
             continue
+
+        if name in _INT_NAMES:
+            value = int(round(value))
 
         globals()[name] = value
 

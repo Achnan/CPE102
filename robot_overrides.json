@@ -1,9 +1,59 @@
 {
-  "GRIPPER_FORWARD_OFFSET": 80.0,
-  "PICKUP_RADIUS": 25.0,
-  "PICKUP_DISTANCE": 25.0,
-  "TURN_ANGLE_THRESHOLD": 15.0,
-  "STOP_DISTANCE": 50.0,
-  "ROBOT_MASK_PADDING": 60.0,
-  "GEM_COLOR_MIN_RATIO": 0.15
+  "GRIPPER_FORWARD_OFFSET": 121,
+  "PICKUP_RADIUS": 30,
+  "PICKUP_DISTANCE": 25,
+  "TURN_ANGLE_THRESHOLD": 15,
+  "STOP_DISTANCE": 50,
+  "ROBOT_MASK_PADDING": 60,
+  "GEM_COLOR_MIN_RATIO": 0.15,
+  "FIELD_ROI_X1_FRAC": 0.0276,
+  "FIELD_ROI_Y1_FRAC": 0.0694,
+  "FIELD_ROI_X2_FRAC": 0.9661,
+  "FIELD_ROI_Y2_FRAC": 0.9648,
+  "FIELD_ROI_POINTS": [
+    [
+      0.0276,
+      0.0694
+    ],
+    [
+      0.85,
+      0.0287
+    ],
+    [
+      0.95,
+      0.0491
+    ],
+    [
+      0.9661,
+      0.0694
+    ],
+    [
+      0.9609,
+      0.1667
+    ],
+    [
+      0.9583,
+      0.2333
+    ],
+    [
+      0.9615,
+      0.3861
+    ],
+    [
+      0.9661,
+      0.9648
+    ],
+    [
+      0.1286,
+      0.9315
+    ],
+    [
+      0.0542,
+      0.9491
+    ],
+    [
+      0.0401,
+      0.9194
+    ]
+  ]
 }

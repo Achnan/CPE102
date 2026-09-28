@@ -1,7 +1,23 @@
+import math
+
 import cv2
 import numpy as np
 
 import config
+import field_area
+
+# A loose "gem" that sits on / touching a base is really part of that base
+# (glare, a reflection, a piece of the base's rim), not something to go and
+# pick up. Two checks catch it:
+#  - inside a detected base circle, grown by this factor to cover the
+#    base's white rim (see split_gems_by_targets)
+BASE_EXCLUDE_MARGIN = 1.25
+#  - inside ANY big colored blob (a base that wasn't recognized as a clean
+#    circle, e.g. half hidden by the robot). Only blobs up to this many times
+#    TARGET_AREA_FRACTION count, so a huge floor-colored area can't hide
+#    every real gem. Set to 0 to turn this check off.
+BIG_BLOB_MAX_AREA_FACTOR = 30
+BIG_BLOB_MARGIN = 1.1
 
 _kernel = np.ones((config.MORPH_KERNEL_SIZE, config.MORPH_KERNEL_SIZE), np.uint8)
 
@@ -42,6 +58,9 @@ def clean_mask(mask):
 
 def get_field_roi_pixels(height, width):
     """
+    (Old rectangle boundary - still used as the fallback when no
+    click-point polygon has been saved.)
+
     Convert config.FIELD_ROI_*_FRAC (0.0-1.0 fractions) into an actual
     pixel rectangle (x1, y1, x2, y2) for this frame's size. Clamped and
     sorted so a slider glitch (e.g. X2 < X1) can't produce a broken
@@ -59,6 +78,17 @@ def get_field_roi_pixels(height, width):
     return (x1, y1, x2, y2)
 
 
+def get_field_polygon_pixels(height, width):
+    """
+    The click-point field area (saved by field_roi_tuner.py) as an
+    int32 pixel array shaped (N, 2), or None if no polygon is saved.
+    """
+    points = field_area.get_points()
+    if points is None:
+        return None
+    return field_area.to_pixels(points, height, width)
+
+
 def apply_field_roi(hsv_image, roi):
     """
     Zero out everything OUTSIDE the field boundary rectangle so it can
@@ -71,6 +101,18 @@ def apply_field_roi(hsv_image, roi):
     masked = np.zeros_like(hsv_image)
     masked[y1:y2, x1:x2] = hsv_image[y1:y2, x1:x2]
     return masked
+
+
+def apply_field_polygon(hsv_image, polygon):
+    """
+    Same idea as apply_field_roi, but for the click-point shape: zero
+    out everything outside the polygon, so a tilted / non-square field
+    (and the wall around it) is handled exactly.
+    """
+
+    mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], 255)
+    return cv2.bitwise_and(hsv_image, hsv_image, mask=mask)
 
 
 def sample_color_at(hsv_image, center_x, center_y, radius):
@@ -126,17 +168,23 @@ def detect_target_circles_and_gems(image, hsv_image, robot_roi):
         gems), which are NOT blanked near the robot so a gem next
         to the robot doesn't disappear
 
-    Both passes are first restricted to the field boundary rectangle
-    (config.FIELD_ROI_*_FRAC), so anything outside it - like a wall
-    that happens to share a gem's color - is excluded entirely.
+    Both passes are first restricted to the field area, so anything
+    outside it - like a wall that happens to share a gem's color - is
+    excluded entirely. The field area is the click-point polygon from
+    field_roi_tuner.py if one is saved, otherwise the old rectangle
+    (config.FIELD_ROI_*_FRAC).
 
     Returns (detected_objects, field_gems) - both lists of dicts.
     """
 
     height, width = image.shape[:2]
 
-    field_roi = get_field_roi_pixels(height, width)
-    hsv_image = apply_field_roi(hsv_image, field_roi)
+    polygon = get_field_polygon_pixels(height, width)
+    if polygon is not None:
+        hsv_image = apply_field_polygon(hsv_image, polygon)
+    else:
+        field_roi = get_field_roi_pixels(height, width)
+        hsv_image = apply_field_roi(hsv_image, field_roi)
 
     hsv_for_targets = hsv_image.copy()
     if robot_roi is not None:
@@ -149,6 +197,7 @@ def detect_target_circles_and_gems(image, hsv_image, robot_roi):
 
     detected_objects = []
     field_gems = []
+    big_blobs = []   # (x, y, radius) of colored blobs too big to be gems
 
     for name, (ranges, box_color) in config.COLORS.items():
 
@@ -203,7 +252,16 @@ def detect_target_circles_and_gems(image, hsv_image, robot_roi):
         for contour in contours:
 
             area = cv2.contourArea(contour)
-            if area < gem_min_area or area >= min_area:
+
+            if area >= min_area:
+                # Too big to be a gem - but remember it, so small blobs
+                # sitting inside it can be recognized as part of a base.
+                if BIG_BLOB_MAX_AREA_FACTOR > 0 and area <= BIG_BLOB_MAX_AREA_FACTOR * min_area:
+                    (bx, by), br = cv2.minEnclosingCircle(contour)
+                    big_blobs.append((bx, by, br))
+                continue
+
+            if area < gem_min_area:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
@@ -215,7 +273,59 @@ def detect_target_circles_and_gems(image, hsv_image, robot_roi):
                 "center_x": x + w // 2, "center_y": y + h // 2,
             })
 
+    # Flag gems that sit inside a big colored blob (see BIG_BLOB_* above).
+    for gem in field_gems:
+        gem["inside_big_blob"] = any(
+            math.hypot(gem["center_x"] - bx, gem["center_y"] - by) <= br * BIG_BLOB_MARGIN
+            for bx, by, br in big_blobs
+        )
+
     return detected_objects, field_gems
+
+
+def split_gems_by_targets(field_gems, target_circles):
+    """
+    Split the loose gems into (kept, ignored). A gem is IGNORED - never
+    chased, never grabbed - when it is really part of a base:
+
+      - it sits inside a base circle (grown by BASE_EXCLUDE_MARGIN so the
+        base's white rim counts, and by the gem's own size so a gem
+        overlapping the edge counts), or
+      - it was flagged inside_big_blob by detect_target_circles_and_gems.
+
+    Uses the same circle the drawing shows: centered on the base's box,
+    radius (width + height) / 4. Call this AFTER target_memory +
+    assign_target_indices, so locked bases (even ones hidden under the
+    robot) are all included.
+    """
+
+    kept = []
+    ignored = []
+
+    for gem in field_gems:
+        on_a_base = gem.get("inside_big_blob", False)
+
+        if not on_a_base:
+            gem_half = max(gem["x2"] - gem["x1"], gem["y2"] - gem["y1"]) / 2.0
+
+            for target in target_circles:
+                cx = (target["x1"] + target["x2"]) / 2.0
+                cy = (target["y1"] + target["y2"]) / 2.0
+                radius = ((target["x2"] - target["x1"]) + (target["y2"] - target["y1"])) / 4.0
+
+                distance = math.hypot(gem["center_x"] - cx, gem["center_y"] - cy)
+                if distance <= radius * BASE_EXCLUDE_MARGIN + gem_half:
+                    on_a_base = True
+                    break
+
+        (ignored if on_a_base else kept).append(gem)
+
+    return kept, ignored
+
+
+def remove_gems_inside_targets(field_gems, target_circles):
+    """Same as split_gems_by_targets, but returns only the gems to keep."""
+    return split_gems_by_targets(field_gems, target_circles)[0]
 
 
 def get_side(target_index):

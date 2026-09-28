@@ -2,13 +2,19 @@
 Robot Config Tuner
 ===================
 A settings panel for everything that used to require editing code:
-    - Drive speed / turn speed (sent live to the ESP32, no re-upload needed)
-    - Gripper open/closed angle (sent live to the ESP32)
-    - Wi-Fi-loss command timeout (sent live to the ESP32)
+    - Drive speed / turn speed (auto-pushed to the ESP32 live as you
+      drag - no re-upload, and no key needed to apply it)
+    - Gripper open/closed angle (auto-pushed the same way)
+    - Wi-Fi-loss command timeout (auto-pushed the same way)
     - Pickup radius / pickup distance / gripper offset / turn angle
       threshold / stop-circle size / robot-mask padding / held-color
       ratio (Python-side - saved to robot_overrides.json, which
       config.py auto-loads next time main.py runs)
+
+ESP32-side sliders (Drive Speed, Turn Speed, Gripper angles, Cmd
+Timeout) push to the robot automatically about 0.3s after you stop
+moving the slider - drag it, let go, and the robot updates on its own.
+Press 'e' any time to force an immediate push without waiting.
 
 Drive the robot directly from here to feel the effect of a new speed
 or gripper setting, without running the full vision pipeline. Each
@@ -21,7 +27,9 @@ Controls:
     space           - stop immediately
     g               - grab (close gripper)
     r               - release (open gripper)
-    e               - push the ESP32 sliders to the robot right now (live)
+    e               - force-push the ESP32 sliders right now (bypasses
+                      the auto-push debounce - useful if you want it
+                      to apply instantly instead of waiting ~0.3s)
     p               - save the Python-side sliders to robot_overrides.json
                       (takes effect next time you run main.py)
     b               - both of the above at once
@@ -30,6 +38,7 @@ Controls:
 
 import json
 import os
+import time
 
 import cv2
 import numpy as np
@@ -42,10 +51,18 @@ ROBOT_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 WINDOW = "Robot Config Tuner"
 
+# How often the ESP32-side sliders (speed/gripper/timeout) are allowed
+# to auto-push a new value while being dragged. Without this, moving a
+# slider fires a new HTTP request on every single pixel of movement -
+# this waits until the slider has been still for this long before
+# actually sending, so a drag sends one request when you stop, not
+# fifty while you're moving it.
+AUTO_PUSH_DEBOUNCE_SECONDS = 0.3
+
 # ---- ESP32-side sliders: (label, min, max, default) ----
 ESP32_SLIDERS = [
-    ("Drive Speed", 0, 255, 200),
-    ("Turn Speed", 0, 255, 180),
+    ("Drive Speed", 0, 255, 160),
+    ("Turn Speed", 0, 255, 140),
     ("Gripper Open Angle", 0, 180, 60),
     ("Gripper Closed Angle", 0, 180, 150),
     ("Cmd Timeout ms (x100)", 5, 50, 15),   # 5-50 -> 500-5000ms, step 100ms
@@ -124,7 +141,11 @@ def save_python_overrides(values):
             existing = {}
 
     for label, _lo, _hi, _default, name, scale in PYTHON_SLIDERS:
-        existing[name] = values[label] / scale
+        # scale == 1 means this is really an integer setting (pixels,
+        # degrees) - keep it an int. Only scale != 1 (e.g. the 0-100
+        # percent slider for GEM_COLOR_MIN_RATIO) actually needs float
+        # division.
+        existing[name] = values[label] if scale == 1 else values[label] / scale
 
     with open(ROBOT_OVERRIDE_PATH, "w") as f:
         json.dump(existing, f, indent=2)
@@ -145,8 +166,8 @@ def main():
     # ---- seed ESP32 sliders from the robot's actual current values ----
     live_config = fetch_esp32_config()
     if live_config:
-        cv2.setTrackbarPos("Drive Speed", WINDOW, live_config.get("drive_speed", 200))
-        cv2.setTrackbarPos("Turn Speed", WINDOW, live_config.get("turn_speed", 180))
+        cv2.setTrackbarPos("Drive Speed", WINDOW, live_config.get("drive_speed", 170))
+        cv2.setTrackbarPos("Turn Speed", WINDOW, live_config.get("turn_speed", 140))
         cv2.setTrackbarPos("Gripper Open Angle", WINDOW, live_config.get("gripper_open_angle", 60))
         cv2.setTrackbarPos("Gripper Closed Angle", WINDOW, live_config.get("gripper_closed_angle", 150))
         cv2.setTrackbarPos(
@@ -168,22 +189,71 @@ def main():
 
     print(__doc__)
 
-    canvas_height = 60 + 25 * len(all_sliders) + 160
+    canvas_height = 60 + 25 * len(all_sliders) + 210
     last_action = "stopped"
+    last_action_ok = None  # None = nothing sent yet, True/False = last send result
+
+    # ---- auto-push state ----
+    # last_seen_esp32_values: the ESP32-relevant slider values as of
+    # last loop iteration - used to detect "did a slider just move".
+    # last_pushed_esp32_values: what we last successfully sent - used
+    # to know whether we're currently in sync with the robot.
+    # pending_since: when the sliders most recently changed (resets
+    # the debounce timer); None means nothing is waiting to be sent.
+    # Seeded from the ACTUAL current trackbar positions (which were
+    # just set from the robot's live config, or defaults if it was
+    # unreachable) - not the raw ESP32_SLIDERS defaults - so startup
+    # correctly shows "synced" instead of firing a redundant push.
+    initial_esp32_values = {
+        label: cv2.getTrackbarPos(label, WINDOW) for label, _lo, _hi, _default in ESP32_SLIDERS
+    }
+    last_seen_esp32_values = dict(initial_esp32_values)
+    last_pushed_esp32_values = dict(initial_esp32_values) if live_config else None
+    pending_since = None
+    push_status = "synced" if live_config else "not yet pushed - could not reach robot at startup"
 
     while True:
 
         values = {label: cv2.getTrackbarPos(label, WINDOW) for label, _lo, _hi in all_sliders}
 
+        esp32_values_now = {label: values[label] for label, _lo, _hi, _default in ESP32_SLIDERS}
+
+        if esp32_values_now != last_seen_esp32_values:
+            # A slider just moved - (re)start the debounce timer rather
+            # than sending immediately, so a drag sends once when you
+            # stop, not on every intermediate position.
+            pending_since = time.time()
+            last_seen_esp32_values = esp32_values_now
+
+        if pending_since is not None and (time.time() - pending_since) >= AUTO_PUSH_DEBOUNCE_SECONDS:
+            if push_esp32_config(values):
+                last_pushed_esp32_values = dict(esp32_values_now)
+                push_status = "synced"
+            else:
+                push_status = "push failed - robot unreachable?"
+            pending_since = None
+
         display = np.zeros((canvas_height, 520, 3), dtype=np.uint8)
         display[:] = (40, 40, 40)
 
         y = 30
-        cv2.putText(display, "ESP32 (live) settings:", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(display, "ESP32 SETTINGS sync (speed/gripper/timeout only):", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
         y += 30
         for label, _lo, _hi, _default in ESP32_SLIDERS:
             cv2.putText(display, f"{label}: {values[label]}", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             y += 25
+
+        if pending_since is not None:
+            status_text = f"Sending in {max(0.0, AUTO_PUSH_DEBOUNCE_SECONDS - (time.time() - pending_since)):.1f}s..."
+            status_color = (0, 255, 255)
+        elif esp32_values_now == last_pushed_esp32_values:
+            status_text = "Synced with robot"
+            status_color = (0, 255, 0)
+        else:
+            status_text = push_status
+            status_color = (0, 0, 255)
+        cv2.putText(display, status_text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+        y += 25
 
         y += 15
         cv2.putText(display, "Python-side (vision/nav) settings:", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -194,7 +264,16 @@ def main():
             y += 25
 
         y += 15
-        cv2.putText(display, f"Last action sent: {last_action}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if last_action_ok is None:
+            drive_text = f"Last drive command: {last_action} (none sent yet)"
+            drive_color = (200, 200, 200)
+        elif last_action_ok:
+            drive_text = f"Last drive command: {last_action} -> reached robot OK"
+            drive_color = (0, 255, 0)
+        else:
+            drive_text = f"Last drive command: {last_action} -> FAILED to reach robot!"
+            drive_color = (0, 0, 255)
+        cv2.putText(display, drive_text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, drive_color, 2)
         y += 30
         for line in [
             "i/k/j/l = forward/backward/left/right   space = stop",
@@ -216,40 +295,50 @@ def main():
 
         elif key == ord('i'):
             last_action = "FORWARD"
-            esp32_link.send_command("FORWARD", force=True)
+            last_action_ok = esp32_link.send_command("FORWARD", force=True)
 
         elif key == ord('k'):
             last_action = "BACKWARD"
-            esp32_link.send_command("BACKWARD", force=True)
+            last_action_ok = esp32_link.send_command("BACKWARD", force=True)
 
         elif key == ord('j'):
             last_action = "LEFT"
-            esp32_link.send_command("LEFT", force=True)
+            last_action_ok = esp32_link.send_command("LEFT", force=True)
 
         elif key == ord('l'):
             last_action = "RIGHT"
-            esp32_link.send_command("RIGHT", force=True)
+            last_action_ok = esp32_link.send_command("RIGHT", force=True)
 
         elif key == ord(' '):
             last_action = "STOP"
-            esp32_link.send_command("STOP", force=True)
+            last_action_ok = esp32_link.send_command("STOP", force=True)
 
         elif key == ord('g'):
             last_action = "GRAB"
-            esp32_link.send_command("GRAB", force=True)
+            last_action_ok = esp32_link.send_command("GRAB", force=True)
 
         elif key == ord('r'):
             last_action = "RELEASE"
-            esp32_link.send_command("RELEASE", force=True)
+            last_action_ok = esp32_link.send_command("RELEASE", force=True)
 
         elif key == ord('e'):
-            push_esp32_config(values)
+            if push_esp32_config(values):
+                last_pushed_esp32_values = dict(esp32_values_now)
+                push_status = "synced"
+            else:
+                push_status = "push failed - robot unreachable?"
+            pending_since = None
 
         elif key == ord('p'):
             save_python_overrides(values)
 
         elif key == ord('b'):
-            push_esp32_config(values)
+            if push_esp32_config(values):
+                last_pushed_esp32_values = dict(esp32_values_now)
+                push_status = "synced"
+            else:
+                push_status = "push failed - robot unreachable?"
+            pending_since = None
             save_python_overrides(values)
 
     cv2.destroyAllWindows()
