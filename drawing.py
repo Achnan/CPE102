@@ -2,6 +2,7 @@ import cv2
 
 import config
 import vision
+from navigation import PRE_OPEN_DISTANCE_FACTOR
 
 
 def draw_robot_heading(result, robot_info):
@@ -118,7 +119,8 @@ def draw_ignored_gems(result, ignored_gems):
 
 
 def draw_navigation(result, robot_center, gripper_center, held_gem_color, nav):
-    """Draws the aim line, target circle, PICK!/PLACE! label and status text."""
+    """Draws the aim line, target circle, pre-open zone, PICK!/PLACE!/OPEN!
+    label and status text."""
 
     if nav["nav_target_point"] is None or gripper_center is None:
         return
@@ -126,9 +128,22 @@ def draw_navigation(result, robot_center, gripper_center, held_gem_color, nav):
     tx, ty = nav["nav_target_point"]
     ready = nav["ready_to_grab"] or nav["ready_to_place"]
 
+    # NEW: the pre-open zone (only meaningful while chasing a GEM, i.e. not
+    # holding one yet) - a lighter, thinner circle drawn OUTSIDE the pickup
+    # circle, so you can see the moment the claw is told to open, before
+    # the robot actually reaches the gem.
+    if held_gem_color is None and not ready:
+        pre_open_radius = getattr(
+            config, "GRIPPER_PRE_OPEN_DISTANCE",
+            config.PICKUP_DISTANCE * PRE_OPEN_DISTANCE_FACTOR
+        )
+        pre_open_color = (255, 200, 255) if nav["ready_to_open"] else (140, 100, 140)
+        cv2.circle(result, (int(tx), int(ty)), int(pre_open_radius), pre_open_color, 1)
+
     label = (
         "PICK!" if nav["ready_to_grab"] else
         "PLACE!" if nav["ready_to_place"] else
+        "OPEN!" if (held_gem_color is None and nav["ready_to_open"]) else
         "HOLDING" if held_gem_color else
         "PICKUP"
     )

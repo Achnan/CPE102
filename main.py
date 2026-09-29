@@ -117,6 +117,11 @@ def main():
     grabbed_this_cycle = False
     placed_this_cycle = False
 
+    # NEW: tracks whether the claw has already been pre-opened for the
+    # gem currently being approached, so RELEASE is only sent once per
+    # approach instead of every frame while inside the pre-open zone.
+    opened_this_cycle = False
+
     frame_count = 0
 
     while True:
@@ -195,6 +200,7 @@ def main():
             print(
                 f"nav command -> {nav['nav_command']} "
                 f"(aiming at: {nav['nav_target_label']}, angle_diff: {nav['angle_diff']}, "
+                f"ready_to_open: {nav['ready_to_open']}, "
                 f"ready_to_grab: {nav['ready_to_grab']}, ready_to_place: {nav['ready_to_place']})"
             )
 
@@ -220,6 +226,15 @@ def main():
             placed_this_cycle = True
 
         else:
+            # NEW: pre-open the claw once, on the way in, before the robot
+            # is actually close enough to grab. This does NOT block driving:
+            # RELEASE is sent as a one-shot priority command (a brief pause
+            # on the ESP32 side while the servo moves), then the regular
+            # movement command below keeps being sent every frame as usual.
+            if nav["ready_to_open"] and not opened_this_cycle:
+                sender.send_priority("RELEASE")
+                opened_this_cycle = True
+
             sender.set_command(nav["nav_command"])
 
         # Reset the one-shot guards when the held/not-held state
@@ -232,6 +247,7 @@ def main():
 
         if not is_holding and was_holding:
             grabbed_this_cycle = False  # just placed/dropped - ready to grab next
+            opened_this_cycle = False   # ready to pre-open for the next gem too
 
         was_holding = is_holding
 

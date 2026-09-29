@@ -12,8 +12,8 @@ import config
 
 # True  = measure the turn angle from the grip spot (what you asked for).
 # False = measure it from the robot center (the point it actually spins
-#         around). Both agree once the robot is lined up, but the grip-spot
-#         angle changes faster while turning, so if it still wobbles, try False.
+# around). Both agree once the robot is lined up, but the grip-spot angle
+# changes faster while turning, so if it still wobbles, try False.
 STEER_FROM_GRIPPER = True
 
 # Turning is done in short pulses (turn a little, STOP, let the camera catch
@@ -26,24 +26,45 @@ FULL_TURN_ANGLE = 50.0         # at this error (deg) or more: turn continuously
 # past TURN_ANGLE_THRESHOLD * this factor (stops FORWARD <-> turn flicker).
 FORWARD_RELEASE_FACTOR = 1.5
 
+# ---- pre-open the gripper on approach --------------------------------------
+# Only matters while NOT holding a gem (target = a gem to pick up). Once the
+# gripper gets within PRE_OPEN_DISTANCE_FACTOR x PICKUP_DISTANCE of the gem,
+# nav["ready_to_open"] turns True so main.py can send RELEASE (open the claw)
+# BEFORE the robot is actually close enough to grab - so the claw is already
+# open and ready by the time it reaches the gem, instead of arriving with a
+# closed claw and pushing the gem away.
+#
+# Must be > 1.0 (a pre-open zone smaller than the pickup zone would never
+# trigger before ready_to_grab does). If you'd rather set an exact pixel
+# distance instead of a multiple of PICKUP_DISTANCE, add
+# GRIPPER_PRE_OPEN_DISTANCE to config.py - it's read here if present and
+# overrides the factor.
+PRE_OPEN_DISTANCE_FACTOR = 2.5
+
 _steer = {"forwarding": False}
 
 
 def _angle_diff(angle_to_target, heading_deg):
     diff = angle_to_target - heading_deg
+
     while diff > 180:
         diff -= 360
+
     while diff < -180:
         diff += 360
+
     return diff
 
 
-# ---- target lock state ----
-# Persists across calls (this module is used by exactly one robot/loop
-# at a time) so the robot commits to one physical gem/target instead of
-# re-evaluating "which one is nearest" fresh every single frame - see
-# the big comment in compute_navigation() for why that matters.
-_locked = {"kind": None, "color": None, "x": None, "y": None}
+# ---- target lock state ----------------------------------------------------
+# Persists across calls so the robot commits to one physical gem/target
+# instead of re-evaluating "which one is nearest" every single frame.
+_locked = {
+    "kind": None,
+    "color": None,
+    "x": None,
+    "y": None
+}
 
 
 def _clear_lock():
@@ -63,23 +84,24 @@ def _set_lock(kind, item):
 def _find_locked_match(items, color, x, y):
     """
     Find whichever item in `items` is the same color and within
-    TARGET_LOCK_MAX_DRIFT_PX of the locked position - i.e. "probably
-    still the same physical object", not just "happens to be closest
-    to the robot right now".
+    TARGET_LOCK_MAX_DRIFT_PX of the locked position.
     """
 
     best = None
     best_dist = None
 
     for item in items:
+
         if item["color"] != color:
             continue
 
         dx = item["center_x"] - x
         dy = item["center_y"] - y
+
         distance = (dx * dx + dy * dy) ** 0.5
 
         if distance <= config.TARGET_LOCK_MAX_DRIFT_PX:
+
             if best_dist is None or distance < best_dist:
                 best_dist = distance
                 best = item
@@ -88,14 +110,20 @@ def _find_locked_match(items, color, x, y):
 
 
 def _nearest(items, origin):
-    """Item closest to `origin` (now the GRIP SPOT, not the robot center)."""
+    """
+    Find the item closest to the origin.
+
+    For gem selection, origin is the GRIP SPOT.
+    """
 
     nearest_item = None
     nearest_distance = None
 
     for item in items:
+
         dx = item["center_x"] - origin[0]
         dy = item["center_y"] - origin[1]
+
         distance = np.sqrt(dx * dx + dy * dy)
 
         if nearest_distance is None or distance < nearest_distance:
@@ -105,35 +133,43 @@ def _nearest(items, origin):
     return nearest_item
 
 
-def compute_navigation(robot_center, robot_heading_deg, gripper_center,
-                        held_gem_color, field_gems, target_circles):
+def compute_navigation(
+    robot_center,
+    robot_heading_deg,
+    gripper_center,
+    held_gem_color,
+    field_gems,
+    target_circles
+):
     """
     Decide what the robot should do this frame.
 
-    - If not holding a gem: aim at a gem. STOP + ready_to_grab once
-      that gem is inside the pickup circle.
-    - If holding a gem: aim at the target circle matching
-      held_gem_color. STOP + ready_to_place once inside the pickup circle.
+    NOT HOLDING A GEM:
+        - Choose a GEM from field_gems.
+        - Move toward that gem.
+        - Once close enough (PRE_OPEN_DISTANCE_FACTOR x PICKUP_DISTANCE),
+          set ready_to_open = True so main.py opens the claw in advance.
+        - STOP when the gem enters the pickup circle.
+        - Set ready_to_grab = True.
 
-    AIM POINT: everything is measured from the GRIP SPOT
-    (gripper_center), not the ArUco/robot center - the turn angle, and
-    which gem/target counts as "nearest". So the robot lines up its
-    claw with the target, not its body. (robot_center is still needed
-    to know the robot was detected at all.)
+    HOLDING A GEM:
+        - Use held_gem_color.
+        - Find the TARGET CIRCLE with the same color.
+        - Move toward that target circle.
+        - STOP when the target enters the pickup circle.
+        - Set ready_to_place = True.
 
-    TARGET LOCKING: rather than picking "whichever is nearest" fresh
-    every frame (which can flip back and forth between two similarly-
-    distant candidates as the robot moves, making it constantly re-aim
-    instead of finishing the approach), this commits to one specific
-    gem/target and keeps chasing THAT one - matched by color and being
-    within TARGET_LOCK_MAX_DRIFT_PX of where it was last seen - until
-    it's reached (picked up/placed) or it can no longer be found nearby
-    (e.g. a false-positive that vanished). Only then is a new nearest
-    one chosen.
+    The robot therefore follows:
 
-    Returns a dict with everything the drawing/UI layer needs:
-        nav_command, nav_target_point, nav_target_label,
-        angle_diff, gripper_distance, ready_to_grab, ready_to_place
+        GEM
+         |
+        (claw opens early on approach)
+         |
+        GRAB
+         |
+        TARGET CIRCLE
+         |
+        RELEASE
     """
 
     nav = {
@@ -144,113 +180,319 @@ def compute_navigation(robot_center, robot_heading_deg, gripper_center,
         "gripper_distance": None,
         "ready_to_grab": False,
         "ready_to_place": False,
+        "ready_to_open": False,
     }
+
+    # ------------------------------------------------------------------
+    # Robot or gripper not detected
+    # ------------------------------------------------------------------
 
     if robot_center is None or gripper_center is None:
         _steer["forwarding"] = False
         return nav
 
+    # ==================================================================
+    # STEP 1: NOT HOLDING A GEM
+    #
+    # Choose from field_gems.
+    #
+    # field_gems are the detected loose gems (the square detection
+    # boxes shown around the gems in your camera view).
+    # ==================================================================
+
     if held_gem_color is None:
-        # Not holding anything - we want a GEM lock. Drop any leftover
-        # target-circle lock from a previous placement cycle.
+
+        # We are not holding anything.
+        # Therefore we should NOT look for a target circle.
+        #
+        # If a target lock remains from a previous placement,
+        # remove it.
         if _locked["kind"] == "target":
             _clear_lock()
 
         chosen = None
+
+        # --------------------------------------------------------------
+        # Continue following the same gem if possible
+        # --------------------------------------------------------------
+
         if _locked["kind"] == "gem":
-            chosen = _find_locked_match(field_gems, _locked["color"], _locked["x"], _locked["y"])
+
+            chosen = _find_locked_match(
+                field_gems,
+                _locked["color"],
+                _locked["x"],
+                _locked["y"]
+            )
+
+        # --------------------------------------------------------------
+        # If we found the locked gem, update its position
+        # --------------------------------------------------------------
 
         if chosen is not None:
-            _set_lock("gem", chosen)   # refresh the lock to its current position
+
+            _set_lock("gem", chosen)
+
         else:
-            # No valid lock yet, or the locked gem is gone - pick a
-            # fresh nearest one and start a new lock.
+
+            # The previous gem disappeared or there is no lock yet.
+            #
+            # Choose a new nearest GEM.
+            #
+            # IMPORTANT:
+            # This searches field_gems, NOT target_circles.
             _clear_lock()
-            chosen = _nearest(field_gems, gripper_center)
+
+            chosen = _nearest(
+                field_gems,
+                gripper_center
+            )
+
             if chosen is not None:
                 _set_lock("gem", chosen)
 
+        # --------------------------------------------------------------
+        # Aim at the selected GEM
+        # --------------------------------------------------------------
+
         if chosen is not None:
-            nav["nav_target_point"] = (chosen["center_x"], chosen["center_y"])
-            nav["nav_target_label"] = f"gem:{chosen['color']}"
+
+            nav["nav_target_point"] = (
+                chosen["center_x"],
+                chosen["center_y"]
+            )
+
+            nav["nav_target_label"] = (
+                f"gem:{chosen['color']}"
+            )
+
+    # ==================================================================
+    # STEP 2: HOLDING A GEM
+    #
+    # Now find the destination circle with the same color.
+    # ==================================================================
 
     else:
-        # Holding a gem - we want a TARGET lock. Drop any leftover gem lock.
+
+        # We are holding a gem.
+        #
+        # Therefore we should no longer follow the old gem.
         if _locked["kind"] == "gem":
             _clear_lock()
 
         chosen = None
-        if _locked["kind"] == "target" and _locked["color"] == held_gem_color:
-            chosen = _find_locked_match(target_circles, held_gem_color, _locked["x"], _locked["y"])
+
+        # --------------------------------------------------------------
+        # Continue following the same target circle if possible
+        # --------------------------------------------------------------
+
+        if (
+            _locked["kind"] == "target"
+            and _locked["color"] == held_gem_color
+        ):
+
+            chosen = _find_locked_match(
+                target_circles,
+                held_gem_color,
+                _locked["x"],
+                _locked["y"]
+            )
+
+        # --------------------------------------------------------------
+        # Update existing target lock
+        # --------------------------------------------------------------
 
         if chosen is not None:
+
             _set_lock("target", chosen)
+
         else:
+
+            # No valid target lock.
+            #
+            # Find circles that have the same color as the held gem.
             _clear_lock()
-            matching = [t for t in target_circles if t["color"] == held_gem_color]
+
+            matching = [
+                t for t in target_circles
+                if t["color"] == held_gem_color
+            ]
+
             if matching:
+
                 chosen = min(
                     matching,
-                    key=lambda t: (t["center_x"] - gripper_center[0]) ** 2
-                    + (t["center_y"] - gripper_center[1]) ** 2
+                    key=lambda t:
+                        (t["center_x"] - gripper_center[0]) ** 2
+                        + (t["center_y"] - gripper_center[1]) ** 2
                 )
+
                 _set_lock("target", chosen)
 
+        # --------------------------------------------------------------
+        # Aim at the selected TARGET CIRCLE
+        # --------------------------------------------------------------
+
         if chosen is not None:
-            nav["nav_target_point"] = (chosen["center_x"], chosen["center_y"])
-            nav["nav_target_label"] = f"target {chosen['target_index']}:{chosen['color']}"
+
+            nav["nav_target_point"] = (
+                chosen["center_x"],
+                chosen["center_y"]
+            )
+
+            nav["nav_target_label"] = (
+                f"target {chosen['target_index']}:{chosen['color']}"
+            )
+
+    # ==================================================================
+    # No target found
+    # ==================================================================
 
     if nav["nav_target_point"] is None:
+
         _steer["forwarding"] = False
         return nav
 
     tx, ty = nav["nav_target_point"]
 
-    # Angle to the target, measured from the grip spot (or the robot center
-    # if STEER_FROM_GRIPPER is False - see the constants at the top).
-    aim_origin = gripper_center if STEER_FROM_GRIPPER else robot_center
-    angle_to_target = np.degrees(
-        np.arctan2(ty - aim_origin[1], tx - aim_origin[0])
+    # ==================================================================
+    # Calculate angle to target
+    # ==================================================================
+
+    aim_origin = (
+        gripper_center
+        if STEER_FROM_GRIPPER
+        else robot_center
     )
-    angle_diff = _angle_diff(angle_to_target, robot_heading_deg)
+
+    angle_to_target = np.degrees(
+        np.arctan2(
+            ty - aim_origin[1],
+            tx - aim_origin[0]
+        )
+    )
+
+    angle_diff = _angle_diff(
+        angle_to_target,
+        robot_heading_deg
+    )
+
     nav["angle_diff"] = angle_diff
+
+    # ==================================================================
+    # Calculate distance from GRIPPER to target
+    # ==================================================================
 
     gdx = tx - gripper_center[0]
     gdy = ty - gripper_center[1]
-    gripper_distance = np.sqrt(gdx * gdx + gdy * gdy)
+
+    gripper_distance = np.sqrt(
+        gdx * gdx + gdy * gdy
+    )
+
     nav["gripper_distance"] = gripper_distance
 
-    in_pickup_zone = gripper_distance <= config.PICKUP_DISTANCE
+    # ==================================================================
+    # Check whether target is inside pickup/gripper circle
+    # ==================================================================
 
+    in_pickup_zone = (
+        gripper_distance <= config.PICKUP_DISTANCE
+    )
+
+    # If we are NOT holding a gem:
+    # target = gem
+    # therefore entering the circle means READY TO GRAB.
     if held_gem_color is None:
+
         nav["ready_to_grab"] = in_pickup_zone
+
+        # ---- pre-open check (approach zone, bigger than the pickup zone) ----
+        pre_open_distance = getattr(
+            config, "GRIPPER_PRE_OPEN_DISTANCE",
+            config.PICKUP_DISTANCE * PRE_OPEN_DISTANCE_FACTOR
+        )
+        nav["ready_to_open"] = gripper_distance <= pre_open_distance
+
+    # If we ARE holding a gem:
+    # target = destination circle
+    # therefore entering the circle means READY TO PLACE.
     else:
+
         nav["ready_to_place"] = in_pickup_zone
 
+    # ==================================================================
+    # Target reached
+    # ==================================================================
+
     if in_pickup_zone:
+
         _steer["forwarding"] = False
+
         nav["nav_command"] = "STOP"
+
         return nav
 
-    # Hysteresis: it takes a bigger error to LEAVE forward than to enter it.
+    # ==================================================================
+    # Hysteresis
+    # ==================================================================
+
     threshold = config.TURN_ANGLE_THRESHOLD
+
     if _steer["forwarding"]:
         threshold *= FORWARD_RELEASE_FACTOR
 
+    # ==================================================================
+    # Move forward if angle is small enough
+    # ==================================================================
+
     if abs(angle_diff) <= threshold:
+
         _steer["forwarding"] = True
+
         nav["nav_command"] = "FORWARD"
+
         return nav
 
-    _steer["forwarding"] = False
-    direction = "RIGHT" if angle_diff > 0 else "LEFT"
+    # ==================================================================
+    # Otherwise turn
+    # ==================================================================
 
-    # Pulsed turning: small error -> short pulse, big error -> continuous.
-    duty = min(1.0, max(MIN_TURN_DUTY, abs(angle_diff) / FULL_TURN_ANGLE))
+    _steer["forwarding"] = False
+
+    direction = (
+        "RIGHT"
+        if angle_diff > 0
+        else "LEFT"
+    )
+
+    # ==================================================================
+    # Pulsed turning
+    # ==================================================================
+
+    duty = min(
+        1.0,
+        max(
+            MIN_TURN_DUTY,
+            abs(angle_diff) / FULL_TURN_ANGLE
+        )
+    )
+
     if duty >= 0.99:
+
         nav["nav_command"] = direction
+
     else:
-        phase = time.monotonic() % TURN_PULSE_PERIOD_SEC
-        nav["nav_command"] = direction if phase < duty * TURN_PULSE_PERIOD_SEC else "STOP"
+
+        phase = (
+            time.monotonic()
+            % TURN_PULSE_PERIOD_SEC
+        )
+
+        nav["nav_command"] = (
+            direction
+            if phase < duty * TURN_PULSE_PERIOD_SEC
+            else "STOP"
+        )
 
     return nav

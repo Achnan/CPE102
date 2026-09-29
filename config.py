@@ -114,6 +114,15 @@ FIELD_ROI_Y2_FRAC = 1.0
 GRIPPER_FORWARD_OFFSET = 80
 PICKUP_RADIUS = 25
 PICKUP_DISTANCE = 25          # gem/target center must be within this to count
+
+# While approaching a gem (not holding anything yet), the gripper opens
+# proactively once the gem is within THIS distance - wider than
+# PICKUP_DISTANCE - so the jaws are already open by the time the robot
+# gets close, instead of arriving with jaws still closed from the last
+# cycle and pushing the gem out of the way. Must stay bigger than
+# PICKUP_DISTANCE (open early, then close once truly aligned).
+PICKUP_PREOPEN_DISTANCE = 70
+
 GEM_SAMPLE_RADIUS = PICKUP_RADIUS
 GEM_COLOR_MIN_RATIO = 0.15    # min fraction of sample area to call a color "held"
 
@@ -176,7 +185,7 @@ _ROBOT_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 _ROBOT_OVERRIDABLE_NAMES = {
     "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
     "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
-    "GEM_COLOR_MIN_RATIO", "TARGET_LOCK_MAX_DRIFT_PX",
+    "GEM_COLOR_MIN_RATIO", "TARGET_LOCK_MAX_DRIFT_PX", "PICKUP_PREOPEN_DISTANCE",
     "FIELD_ROI_X1_FRAC", "FIELD_ROI_Y1_FRAC", "FIELD_ROI_X2_FRAC", "FIELD_ROI_Y2_FRAC",
 }
 
@@ -202,7 +211,7 @@ def _load_robot_overrides():
     _INT_NAMES = {
         "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
         "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
-        "TARGET_LOCK_MAX_DRIFT_PX",
+        "TARGET_LOCK_MAX_DRIFT_PX", "PICKUP_PREOPEN_DISTANCE",
     }
 
     for name, value in overrides.items():
