@@ -4,12 +4,21 @@ Grip Tuner
 Adjust where the grip spot sits and how big the pickup circle is, while
 WATCHING it on the live camera image next to the robot.
 
-    Gripper Fwd Offset - how far in front of the robot's center the grip
-                         spot (magenta dot) sits, in pixels
-    Pickup Radius      - size of the magenta pickup circle, in pixels
+    Gripper Fwd Offset  - how far in front of the robot's center the grip
+                          spot (magenta dot) sits, in pixels
+    Pickup Radius       - size of the magenta pickup circle, in pixels
+    Grip Angle Offset   - rotates the direction the offset is measured in,
+                          away from the robot's raw ArUco heading. Use this
+                          if your top-view camera is mounted at a slight
+                          slant, so "straight ahead" in the image doesn't
+                          line up with where the gripper actually is -
+                          the magenta dot will trace a slanted line instead
+                          of a straight one as you turn the robot.
 
 Line up the magenta dot with where the gripper actually closes (put a
-gem in the claw and check), then press 's' to save.
+gem in the claw and check, ideally with the robot turned to a couple of
+different headings so the slant is corrected everywhere, not just at one
+angle), then press 's' to save.
 
 Controls:
     s        - save both values to robot_overrides.json
@@ -36,13 +45,14 @@ WINDOW = "Grip Tuner"
 
 OFFSET_MAX = 200
 RADIUS_MIN, RADIUS_MAX = 5, 100
+ANGLE_MAX_DEG = 45   # slider covers -45 to +45 degrees of slant
 
 
 def _nothing(_value):
     pass
 
 
-def save_values(offset, radius):
+def save_values(offset, radius, angle_deg):
     """Merge into robot_overrides.json so other saved settings are kept."""
 
     existing = {}
@@ -55,11 +65,12 @@ def save_values(offset, radius):
 
     existing["GRIPPER_FORWARD_OFFSET"] = int(offset)
     existing["PICKUP_RADIUS"] = int(radius)
+    existing["GRIPPER_ANGLE_OFFSET_DEG"] = int(angle_deg)
 
     with open(ROBOT_OVERRIDE_PATH, "w") as f:
         json.dump(existing, f, indent=2)
 
-    print(f"[grip_tuner] Saved offset={offset}, radius={radius} to {ROBOT_OVERRIDE_PATH}")
+    print(f"[grip_tuner] Saved offset={offset}, radius={radius}, angle={angle_deg} to {ROBOT_OVERRIDE_PATH}")
 
 
 def main():
@@ -79,6 +90,12 @@ def main():
         "Pickup Radius", WINDOW,
         min(max(int(config.PICKUP_RADIUS), RADIUS_MIN), RADIUS_MAX), RADIUS_MAX, _nothing
     )
+    current_angle = int(getattr(config, "GRIPPER_ANGLE_OFFSET_DEG", 0))
+    current_angle = min(max(current_angle, -ANGLE_MAX_DEG), ANGLE_MAX_DEG)
+    cv2.createTrackbar(
+        "Grip Angle Offset", WINDOW,
+        current_angle + ANGLE_MAX_DEG, ANGLE_MAX_DEG * 2, _nothing
+    )
 
     print(__doc__)
 
@@ -93,11 +110,13 @@ def main():
 
         offset = cv2.getTrackbarPos("Gripper Fwd Offset", WINDOW)
         radius = max(RADIUS_MIN, cv2.getTrackbarPos("Pickup Radius", WINDOW))
+        angle_deg = cv2.getTrackbarPos("Grip Angle Offset", WINDOW) - ANGLE_MAX_DEG
 
         # Push the slider values into config so the SAME functions main.py
         # uses (robot_tracker + drawing) pick them up live.
         config.GRIPPER_FORWARD_OFFSET = offset
         config.PICKUP_RADIUS = radius
+        config.GRIPPER_ANGLE_OFFSET_DEG = angle_deg
 
         result = frame.copy()
 
@@ -107,7 +126,7 @@ def main():
         gripper_center = robot_tracker.gripper_center_of(robot_info)
         drawing.draw_pickup_circle(result, gripper_center)
 
-        cv2.putText(result, f"Gripper Fwd Offset: {offset}   Pickup Radius: {radius}",
+        cv2.putText(result, f"Gripper Fwd Offset: {offset}   Pickup Radius: {radius}   Grip Angle Offset: {angle_deg} deg",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if robot_info["center"] is None or gripper_center is None:
@@ -135,7 +154,7 @@ def main():
         if key == ord('q') or key == 27:
             break
         elif key == ord('s'):
-            save_values(offset, radius)
+            save_values(offset, radius, angle_deg)
             status = "Saved! Restart main.py to apply."
             status_frames_left = 90
 

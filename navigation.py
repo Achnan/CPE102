@@ -41,7 +41,113 @@ FORWARD_RELEASE_FACTOR = 1.5
 # overrides the factor.
 PRE_OPEN_DISTANCE_FACTOR = 2.5
 
+# ---- stuck-in-a-turning-loop fix --------------------------------------------
+# Problem this fixes: when a gem is right at the edge of the gripper/claw,
+# spinning to line up with it can physically nudge or drag the gem along
+# with the robot's own frame, so the angle to it never actually closes -
+# the robot ends up spinning forever, chasing something that moves with it.
+#
+# Fix: track how long the robot has been continuously TURNING toward the
+# same locked target without making real progress (gripper_distance getting
+# meaningfully smaller). If it's been turning for STUCK_TURN_TIMEOUT_SEC
+# without at least STUCK_PROGRESS_PX of improvement:
+#   - If it's already fairly close (within STUCK_GRAB_DISTANCE_FACTOR x
+#     PICKUP_DISTANCE), stop trying to perfectly align and just force the
+#     grab/place right now - the claw is usually wide enough to catch
+#     something that close even if the angle isn't perfect, and forcing it
+#     beats spinning forever.
+#   - Otherwise, give up on this specific gem/target for a while (it goes on
+#     a short blacklist so it isn't immediately re-chosen as "nearest" the
+#     very next frame) and let the robot pick a different one.
+STUCK_TURN_TIMEOUT_SEC = 3.0        # how long to tolerate turning with no progress
+STUCK_PROGRESS_PX = 15              # must close by at least this much to not be "stuck"
+STUCK_GRAB_DISTANCE_FACTOR = 1.6    # within this x PICKUP_DISTANCE -> force the grab/place
+STUCK_BLACKLIST_SEC = 4.0           # how long an abandoned target is skipped for
+
+# ---- final-approach lock (fix for the gem getting shoved behind the claw) -
+# Problem this fixes: small heading corrections right up until the last
+# moment can nudge a gem sideways or behind the claw instead of into it,
+# especially once it's already close enough to be touching the gripper -
+# and once that happens the robot just keeps re-aiming at wherever the
+# (now-shoved) gem ended up, pushing it further every frame.
+#
+# Fix: once the robot is ALREADY lined up (angle within TURN_ANGLE_THRESHOLD)
+# and gets within FINAL_APPROACH_FACTOR x PICKUP_DISTANCE of the target, the
+# heading is locked - no more re-aiming for the rest of this approach. It
+# just drives straight in, ignoring any apparent angle drift from here on
+# (which close-up is more likely to be the gem being pushed than the robot
+# actually being misaligned). The lock releases only when the target is
+# reached or a different target is picked (see the lock_key check below).
+FINAL_APPROACH_FACTOR = 2.0
+
+_final_lock = {"lock_key": None, "locked": False}
+
+
+def _reset_final_lock():
+    _final_lock["lock_key"] = None
+    _final_lock["locked"] = False
+
+
+def force_replan():
+    """
+    Drop the current target lock and all approach state, so the next frame
+    picks a fresh nearest target instead of continuing to chase whatever
+    was locked. Call this from main.py after a failed grab (the gem may
+    have been shoved out of the gripper's expected position, so continuing
+    to chase its last known spot is unlikely to help).
+    """
+    _clear_lock()
+    _reset_stuck_tracking()
+
+# ---- fully automatic drive speed (no manual "gem speed" / "base speed") --
+# Speed is a continuous function of distance to whatever is currently being
+# approached - a gem OR a base, it doesn't matter which - so "runs too fast
+# on the way back to the base" is fixed the same way as "overshoots the
+# gem": both are just "too fast when close", and this slows down for BOTH
+# automatically, with no per-phase number to configure.
+#
+# MAX_DRIVE_SPEED: PWM used from SLOWDOWN_START_PX and beyond (far away).
+# MIN_DRIVE_SPEED: PWM used right at the pickup zone edge (close) - kept
+#   above the motor's real dead zone, or "auto" would ask for a speed that
+#   doesn't actually move the robot at all (same deadband problem turning
+#   already ran into - see TURN_DUTY_PERCENT on the ESP32 firmware).
+# SLOWDOWN_START_PX: distance at which deceleration begins; expressed as a
+#   multiple of PICKUP_DISTANCE so it scales automatically if you retune
+#   the pickup zone size, rather than being a second fixed number to keep
+#   in sync with it.
+MAX_DRIVE_SPEED = 220
+MIN_DRIVE_SPEED = 120
+SLOWDOWN_START_FACTOR = 6.0
+
 _steer = {"forwarding": False}
+
+# turning_since: monotonic time the current stuck-tracked turn started, or
+# None if not currently accumulating (reset whenever real progress is made
+# or the locked target changes).
+# best_distance: closest gripper_distance seen since tracking started for
+# this lock - used to detect "not actually getting closer".
+_stuck = {"lock_key": None, "turning_since": None, "best_distance": None}
+
+# Single-slot blacklist: the one most recently abandoned stuck target, so it
+# isn't immediately re-picked as "nearest" right after giving up on it.
+_blacklist = {"color": None, "x": None, "y": None, "until": 0.0}
+
+
+def _reset_stuck_tracking():
+    _stuck["lock_key"] = None
+    _stuck["turning_since"] = None
+    _stuck["best_distance"] = None
+    _reset_final_lock()
+
+
+def _is_blacklisted(item):
+    if time.monotonic() >= _blacklist["until"]:
+        return False
+    if item["color"] != _blacklist["color"]:
+        return False
+    dx = item["center_x"] - _blacklist["x"]
+    dy = item["center_y"] - _blacklist["y"]
+    return (dx * dx + dy * dy) ** 0.5 <= config.TARGET_LOCK_MAX_DRIFT_PX
 
 
 def _angle_diff(angle_to_target, heading_deg):
@@ -159,6 +265,11 @@ def compute_navigation(
         - STOP when the target enters the pickup circle.
         - Set ready_to_place = True.
 
+    STUCK-IN-A-TURN protection: if turning toward the locked target for too
+    long without making real progress (see STUCK_* constants above), either
+    forces the grab/place (if already close) or abandons that target for a
+    few seconds and lets a different one be chosen - see _stuck / _blacklist.
+
     The robot therefore follows:
 
         GEM
@@ -181,6 +292,7 @@ def compute_navigation(
         "ready_to_grab": False,
         "ready_to_place": False,
         "ready_to_open": False,
+        "drive_speed": MAX_DRIVE_SPEED,
     }
 
     # ------------------------------------------------------------------
@@ -189,6 +301,7 @@ def compute_navigation(
 
     if robot_center is None or gripper_center is None:
         _steer["forwarding"] = False
+        _reset_stuck_tracking()
         return nav
 
     # ==================================================================
@@ -237,14 +350,17 @@ def compute_navigation(
 
             # The previous gem disappeared or there is no lock yet.
             #
-            # Choose a new nearest GEM.
+            # Choose a new nearest GEM (skipping anything on the
+            # stuck-target blacklist - see STUCK_* above).
             #
             # IMPORTANT:
             # This searches field_gems, NOT target_circles.
             _clear_lock()
 
+            candidates = [g for g in field_gems if not _is_blacklisted(g)]
+
             chosen = _nearest(
-                field_gems,
+                candidates,
                 gripper_center
             )
 
@@ -310,12 +426,13 @@ def compute_navigation(
 
             # No valid target lock.
             #
-            # Find circles that have the same color as the held gem.
+            # Find circles that have the same color as the held gem
+            # (skipping anything on the stuck-target blacklist).
             _clear_lock()
 
             matching = [
                 t for t in target_circles
-                if t["color"] == held_gem_color
+                if t["color"] == held_gem_color and not _is_blacklisted(t)
             ]
 
             if matching:
@@ -351,6 +468,7 @@ def compute_navigation(
     if nav["nav_target_point"] is None:
 
         _steer["forwarding"] = False
+        _reset_stuck_tracking()
         return nav
 
     tx, ty = nav["nav_target_point"]
@@ -392,6 +510,43 @@ def compute_navigation(
 
     nav["gripper_distance"] = gripper_distance
 
+    # ---- fully automatic drive speed, based purely on distance ----
+    slowdown_start_px = config.PICKUP_DISTANCE * SLOWDOWN_START_FACTOR
+    span = max(1.0, slowdown_start_px - config.PICKUP_DISTANCE)
+    closeness = 1.0 - min(1.0, max(0.0, (gripper_distance - config.PICKUP_DISTANCE) / span))
+    nav["drive_speed"] = int(round(MAX_DRIVE_SPEED - closeness * (MAX_DRIVE_SPEED - MIN_DRIVE_SPEED)))
+
+    # ==================================================================
+    # Stuck-tracking bookkeeping - do this before the pickup-zone check so
+    # reaching the zone (a real success) always clears the tracker below.
+    # ==================================================================
+
+    lock_key = (_locked["kind"], _locked["color"])
+    if _stuck["lock_key"] != lock_key:
+        # A different physical target than last frame - start fresh.
+        _stuck["lock_key"] = lock_key
+        _stuck["turning_since"] = None
+        _stuck["best_distance"] = gripper_distance
+    elif _stuck["best_distance"] is None or gripper_distance < _stuck["best_distance"] - STUCK_PROGRESS_PX:
+        # Real progress was made since tracking started - forget any
+        # accumulated stuck time and reset the "best" baseline.
+        _stuck["best_distance"] = gripper_distance
+        _stuck["turning_since"] = None
+
+    if _final_lock["lock_key"] != lock_key:
+        _final_lock["lock_key"] = lock_key
+        _final_lock["locked"] = False
+
+    if (
+        not _final_lock["locked"]
+        and gripper_distance <= config.PICKUP_DISTANCE * FINAL_APPROACH_FACTOR
+        and abs(angle_diff) <= config.TURN_ANGLE_THRESHOLD
+    ):
+        # Already lined up and close enough - lock the heading now, before
+        # any contact with the gem has a chance to nudge it and throw off
+        # a fresh angle reading.
+        _final_lock["locked"] = True
+
     # ==================================================================
     # Check whether target is inside pickup/gripper circle
     # ==================================================================
@@ -428,9 +583,21 @@ def compute_navigation(
     if in_pickup_zone:
 
         _steer["forwarding"] = False
+        _reset_stuck_tracking()
 
         nav["nav_command"] = "STOP"
 
+        return nav
+
+    # ==================================================================
+    # Final-approach lock - once engaged (see above), skip re-aiming
+    # entirely and just keep driving straight in.
+    # ==================================================================
+
+    if _final_lock["locked"]:
+        _steer["forwarding"] = True
+        _stuck["turning_since"] = None
+        nav["nav_command"] = "FORWARD"
         return nav
 
     # ==================================================================
@@ -449,16 +616,52 @@ def compute_navigation(
     if abs(angle_diff) <= threshold:
 
         _steer["forwarding"] = True
+        _stuck["turning_since"] = None   # making forward progress, not stuck-turning
 
         nav["nav_command"] = "FORWARD"
 
         return nav
 
     # ==================================================================
-    # Otherwise turn
+    # Otherwise turn - but first check we're not stuck turning in place
     # ==================================================================
 
     _steer["forwarding"] = False
+
+    now = time.monotonic()
+    if _stuck["turning_since"] is None:
+        _stuck["turning_since"] = now
+
+    turning_elapsed = now - _stuck["turning_since"]
+
+    if turning_elapsed >= STUCK_TURN_TIMEOUT_SEC:
+
+        if gripper_distance <= config.PICKUP_DISTANCE * STUCK_GRAB_DISTANCE_FACTOR:
+            # Close enough already - stop fighting the angle (likely being
+            # dragged along by the claw) and just take it now.
+            if held_gem_color is None:
+                nav["ready_to_grab"] = True
+            else:
+                nav["ready_to_place"] = True
+
+            nav["nav_command"] = "STOP"
+            _reset_stuck_tracking()
+            return nav
+
+        # Too far away to force it - give up on this one for a while so it
+        # isn't immediately re-chosen as "nearest" next frame.
+        _blacklist["color"] = _locked["color"]
+        _blacklist["x"] = _locked["x"]
+        _blacklist["y"] = _locked["y"]
+        _blacklist["until"] = now + STUCK_BLACKLIST_SEC
+
+        _clear_lock()
+        _reset_stuck_tracking()
+
+        nav["nav_command"] = "STOP"
+        nav["nav_target_point"] = None
+        nav["nav_target_label"] = None
+        return nav
 
     direction = (
         "RIGHT"

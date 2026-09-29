@@ -1,9 +1,9 @@
 {
-  "GRIPPER_FORWARD_OFFSET": 118,
-  "PICKUP_RADIUS": 17,
+  "GRIPPER_FORWARD_OFFSET": 143,
+  "PICKUP_RADIUS": 27,
   "PICKUP_DISTANCE": 25,
-  "TURN_ANGLE_THRESHOLD": 12,
-  "STOP_DISTANCE": 50,
+  "TURN_ANGLE_THRESHOLD": 6,
+  "STOP_DISTANCE": 68,
   "ROBOT_MASK_PADDING": 60,
   "GEM_COLOR_MIN_RATIO": 0.15,
   "FIELD_ROI_X1_FRAC": 0.0276,
@@ -54,6 +54,19 @@
     [
       0.0401,
       0.9194
+    ],
+    [
+      0.05,
+      0.7824
+    ],
+    [
+      0.0609,
+      0.7556
+    ],
+    [
+      0.0229,
+      0.6852
     ]
-  ]
+  ],
+  "GRIPPER_ANGLE_OFFSET_DEG": -4
 }

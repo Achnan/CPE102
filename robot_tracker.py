@@ -1,5 +1,3 @@
-#======ROBOTTRACK
-
 import cv2
 import numpy as np
 
@@ -85,10 +83,37 @@ def detect_robot(image, detector):
     return info
 
 
+def rotate_vector(vec, angle_deg):
+    """
+    Rotate a 2D vector by angle_deg (standard math rotation: positive angle
+    turns from +x toward +y). Used to slant the grip spot when the top-view
+    camera isn't mounted perfectly perpendicular to the field, so "forward"
+    in the image doesn't quite line up with where the gripper physically is.
+    """
+
+    angle_rad = np.radians(angle_deg)
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    x, y = vec
+    return np.array([x * cos_a - y * sin_a, x * sin_a + y * cos_a])
+
+
 def gripper_center_of(robot_info):
-    """Compute the pickup/placement circle center in front of the robot."""
+    """
+    Compute the pickup/placement circle center in front of the robot.
+
+    GRIPPER_ANGLE_OFFSET_DEG (default 0, tuned live in grip_tuner.py) rotates
+    the direction the offset is applied in, away from the robot's raw ArUco
+    heading - this compensates for a top-view camera that's mounted at a
+    slight slant, where "straight ahead" in the image isn't quite where the
+    gripper actually is relative to the marker.
+    """
 
     if robot_info["center"] is None or robot_info["forward_unit"] is None:
         return None
 
-    return robot_info["center"] + robot_info["forward_unit"] * config.GRIPPER_FORWARD_OFFSET
+    angle_offset = getattr(config, "GRIPPER_ANGLE_OFFSET_DEG", 0.0)
+    direction = robot_info["forward_unit"]
+    if angle_offset:
+        direction = rotate_vector(direction, angle_offset)
+
+    return robot_info["center"] + direction * config.GRIPPER_FORWARD_OFFSET

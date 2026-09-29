@@ -5,6 +5,7 @@ import numpy as np
 
 import config
 import field_area
+import color_toggles
 
 # A loose "gem" that sits on / touching a base is really part of that base
 # (glare, a reflection, a piece of the base's rim), not something to go and
@@ -141,7 +142,9 @@ def sample_color_at(hsv_image, center_x, center_y, radius):
     best_color = None
     best_ratio = 0.0
 
-    for name, (ranges, _box_color) in config.COLORS.items():
+    enabled_colors = color_toggles.filter_enabled_colors(config.COLORS)
+
+    for name, (ranges, _box_color) in enabled_colors.items():
 
         mask = np.zeros(region.shape[:2], dtype=np.uint8)
         for lower, upper in ranges:
@@ -199,7 +202,9 @@ def detect_target_circles_and_gems(image, hsv_image, robot_roi):
     field_gems = []
     big_blobs = []   # (x, y, radius) of colored blobs too big to be gems
 
-    for name, (ranges, box_color) in config.COLORS.items():
+    enabled_colors = color_toggles.filter_enabled_colors(config.COLORS)
+
+    for name, (ranges, box_color) in enabled_colors.items():
 
         # ---- target circles ----
         target_mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)

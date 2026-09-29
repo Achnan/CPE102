@@ -2,8 +2,10 @@
 Robot Config Tuner
 ===================
 A settings panel for everything that used to require editing code:
-    - Drive speed / turn speed (auto-pushed to the ESP32 live as you
-      drag - no re-upload, and no key needed to apply it)
+    - Drive speed / turn speed / turn duty % (auto-pushed to the ESP32
+      live as you drag - no re-upload, and no key needed to apply it).
+      Turn Duty % is the fix for "turn speed is still too fast no matter
+      what I set" - see the note above ESP32_SLIDERS below for why.
     - Gripper open/closed angle for BOTH servos - servo 1 (pin 32) and
       servo 2 (pin 33) each have their own open/closed sliders, so you
       can test and tune each side of the claw independently
@@ -76,9 +78,20 @@ SERVO_TEST_STEP_DEG = 5
 
 # ---- ESP32-side sliders: (label, min, max, default) ----
 # Servo defaults match the two-servo firmware.
+# TURN SPEED FIX: on many small DC gear motors, a single PWM value can't
+# give a real slow turn - below some PWM the motor doesn't move at all, and
+# just above that it jumps almost straight to fast, with no usable middle
+# ground. "Turn Duty" fixes this: the firmware pulses the motor ON (at "Turn
+# Speed") and OFF rapidly while turning, and Turn Duty is the percentage of
+# time spent ON - THIS is what actually controls the average turn speed now.
+# If turning still feels too fast at low Turn Duty, also try RAISING Turn
+# Speed itself (so each pulse has enough torque to actually move) while
+# LOWERING Turn Duty (so it moves less of the time) - e.g. Turn Speed 220,
+# Turn Duty 25, rather than a weak constant PWM that barely moves at all.
 ESP32_SLIDERS = [
     ("Drive Speed", 0, 255, 160),
     ("Turn Speed", 0, 255, 140),
+    ("Turn Duty", 1, 100, 60),           # % of each pulse cycle spent ON while turning
     ("Grip1 Open", 0, 180, 140),        # servo 1 (pin 32)
     ("Grip1 Close", 0, 180, 95),        # servo 1
     ("Grip2 Open", 0, 180, 0),          # servo 2 (pin 33)
@@ -94,6 +107,7 @@ ESP32_SLIDERS = [
 PRETTY_LABEL = {
     "Drive Speed": "Drive Speed",
     "Turn Speed": "Turn Speed",
+    "Turn Duty": "Turn Duty % (avg turn speed)",
     "Grip1 Open": "Gripper1 Open Angle",
     "Grip1 Close": "Gripper1 Closed Angle",
     "Grip2 Open": "Gripper2 Open Angle",
@@ -122,6 +136,15 @@ PYTHON_SLIDERS = [
     ("HeldMin x100", 5, 60, int(config.GEM_COLOR_MIN_RATIO * 100), "GEM_COLOR_MIN_RATIO", 100),
 ]
 
+# NOTE: there is no manual "gem speed" / "base speed" slider here any more -
+# main.py now computes drive speed fully automatically, from distance to
+# whatever it's approaching (see MAX_DRIVE_SPEED / MIN_DRIVE_SPEED /
+# SLOWDOWN_START_FACTOR at the top of navigation.py if you need to adjust
+# the auto ramp's ceiling, floor, or how early it starts slowing down).
+# The plain "Drive Speed" slider above still exists for this tuner's own
+# manual test-driving (i/j/k/l) - it has no effect once main.py is running,
+# since main.py overrides DRIVE_SPEED live with its own auto-computed value.
+
 
 def _nothing(_value):
     pass
@@ -148,6 +171,7 @@ def push_esp32_config(values):
     payload = {
         "drive_speed": values["Drive Speed"],
         "turn_speed": values["Turn Speed"],
+        "turn_duty_percent": values["Turn Duty"],
         "gripper_open_angle": values["Grip1 Open"],
         "gripper_closed_angle": values["Grip1 Close"],
         "gripper2_open_angle": values["Grip2 Open"],
@@ -327,6 +351,7 @@ def main():
     if live_config:
         cv2.setTrackbarPos("Drive Speed", WINDOW, live_config.get("drive_speed", 160))
         cv2.setTrackbarPos("Turn Speed", WINDOW, live_config.get("turn_speed", 140))
+        cv2.setTrackbarPos("Turn Duty", WINDOW, live_config.get("turn_duty_percent", 60))
         cv2.setTrackbarPos("Grip1 Open", WINDOW, live_config.get("gripper_open_angle", 140))
         cv2.setTrackbarPos("Grip1 Close", WINDOW, live_config.get("gripper_closed_angle", 95))
         cv2.setTrackbarPos("Grip2 Open", WINDOW, live_config.get("gripper2_open_angle", 0))
@@ -389,7 +414,7 @@ def main():
     # Bar color per ESP32 slider label, so speed/gripper/timeout are each
     # visually distinct at a glance.
     esp32_bar_color = {
-        "Drive Speed": ACCENT, "Turn Speed": ACCENT,
+        "Drive Speed": ACCENT, "Turn Speed": ACCENT, "Turn Duty": (255, 220, 80),
         "Grip1 Open": (200, 120, 255), "Grip1 Close": (200, 120, 255),
         "Grip2 Open": (255, 140, 220), "Grip2 Close": (255, 140, 220),
         "Cmd TO x100": (140, 200, 140),

@@ -49,6 +49,12 @@ Controls:
     +                                 - add a new range to the current color (clone current)
     -                                 - remove the current range (only if more than 1 left)
     e                                 - eyedropper on / off (click the CAMERA panel to sample)
+    x                                 - enable/disable the selected color for detection
+                                         (a disabled color is completely skipped by
+                                         main.py - as if it weren't tuned at all - until
+                                         you turn it back on here; its saved HSV ranges
+                                         are untouched, so you can still tune it while
+                                         it's off and re-enable it once it's fixed)
     u                                 - eyedropper: undo the last click
     r                                 - eyedropper: forget all clicks (next click starts fresh)
     s                                 - save ALL colors' current ranges to hsv_overrides.json
@@ -65,6 +71,7 @@ import numpy as np
 
 import config
 import vision
+import color_toggles
 
 OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hsv_overrides.json")
 
@@ -191,8 +198,10 @@ def ranges_from_samples(samples, tol_h, tol_sv):
 # Drawing helpers
 # ------------------------------------------------------------------ #
 
-def draw_color_buttons(canvas, color_names, working, selected_index, hover_index):
-    """Draw one clickable button per color across the top of `canvas`."""
+def draw_color_buttons(canvas, color_names, working, selected_index, hover_index, toggles):
+    """Draw one clickable button per color across the top of `canvas`.
+    A disabled color's button is dimmed to near-gray with an "OFF" tag,
+    so it's obvious at a glance which colors main.py will actually use."""
 
     width = canvas.shape[1]
     btn_w = max(1, width // len(color_names))
@@ -201,21 +210,29 @@ def draw_color_buttons(canvas, color_names, working, selected_index, hover_index
         x1 = i * btn_w
         x2 = width if i == len(color_names) - 1 else x1 + btn_w
         box_color = working[name]["box_color"]
+        enabled = toggles.get(name, True)
 
         is_selected = i == selected_index
         is_hover = i == hover_index and not is_selected
 
-        fill = box_color
-        if is_hover:
-            # lighten slightly on hover so it feels responsive
-            fill = tuple(min(255, int(c * 1.25) + 15) for c in box_color)
+        if not enabled:
+            # desaturate toward dark gray so a disabled color is visually
+            # unmistakable even before reading any text
+            fill = tuple(int(c * 0.25 + 40 * 0.75) for c in box_color)
+        else:
+            fill = box_color
+            if is_hover:
+                # lighten slightly on hover so it feels responsive
+                fill = tuple(min(255, int(c * 1.25) + 15) for c in box_color)
 
         cv2.rectangle(canvas, (x1, 0), (x2 - 1, BUTTON_ROW_HEIGHT), fill, -1)
 
-        brightness = 0.114 * box_color[0] + 0.587 * box_color[1] + 0.299 * box_color[2]
+        brightness = 0.114 * fill[0] + 0.587 * fill[1] + 0.299 * fill[2]
         text_color = (255, 255, 255) if brightness < 140 else (20, 20, 20)
 
         label = name if not is_selected else f"* {name}"
+        if not enabled:
+            label += "  OFF"
         (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 2)
         tx = x1 + max(6, (btn_w - tw) // 2)
         ty = BUTTON_ROW_HEIGHT // 2 + th // 2
@@ -233,7 +250,7 @@ def draw_color_buttons(canvas, color_names, working, selected_index, hover_index
     return btn_w
 
 
-def draw_info_bar(canvas, y0, name, range_index, num_ranges, lower, upper, box_color, hsv_pixel=None):
+def draw_info_bar(canvas, y0, name, range_index, num_ranges, lower, upper, box_color, enabled, hsv_pixel=None):
     """Readout of the currently selected color/range + swatches for lower/upper."""
 
     width = canvas.shape[1]
@@ -248,8 +265,11 @@ def draw_info_bar(canvas, y0, name, range_index, num_ranges, lower, upper, box_c
     cv2.rectangle(canvas, (pad, y0 + 10), (pad + 26, y1 - 10), box_color, -1)
     cv2.rectangle(canvas, (pad, y0 + 10), (pad + 26, y1 - 10), (255, 255, 255), 1)
 
-    title = f"{name}  -  range {range_index + 1}/{num_ranges}"
+    status = "ENABLED" if enabled else "DISABLED - press x to re-enable"
+    status_color = (120, 255, 120) if enabled else (100, 100, 255)
+    title = f"{name}  -  range {range_index + 1}/{num_ranges}   [{status}]"
     cv2.putText(canvas, title, (pad + 36, cy + 6), FONT, 0.6, TEXT_COLOR, 2, cv2.LINE_AA)
+    (title_w, _), _ = cv2.getTextSize(title, FONT, 0.6, 2)
 
     # HSV lower/upper swatches, right-aligned
     def hsv_to_bgr(h, s, v):
@@ -301,7 +321,7 @@ def draw_footer(canvas, y0, flash_message=None, flash_color=SAVE_FLASH_COLOR):
     if flash_message:
         text, color = flash_message, flash_color
     else:
-        text = "click/n/p color | [ ] range | + / - add/remove range | e eyedropper | s save | q quit"
+        text = "click/n/p color | [ ] range | +/- range | e eyedropper | x on/off | s save | q quit"
         color = MUTED_TEXT
 
     cv2.putText(canvas, text, (10, y0 + FOOTER_HEIGHT - 9), FONT, 0.48, color, 1, cv2.LINE_AA)
@@ -355,6 +375,7 @@ def main():
 
     working = build_working_copy()
     color_names = list(working.keys())
+    toggles = color_toggles.load_toggles()   # {name: False} for anything turned off
 
     canvas_width = MARGIN * 2 + PANEL_WIDTH * 3 + PANEL_GAP * 2
 
@@ -562,9 +583,9 @@ def main():
         canvas = np.zeros((canvas_h, canvas_width, 3), dtype=np.uint8)
         canvas[:] = BG_COLOR
 
-        draw_color_buttons(canvas, color_names, working, state["color_index"], state["hover_index"])
+        draw_color_buttons(canvas, color_names, working, state["color_index"], state["hover_index"], toggles)
         draw_info_bar(canvas, BUTTON_ROW_HEIGHT, name, state["range_index"], len(ranges),
-                      lower_hsv, upper_hsv, box_color)
+                      lower_hsv, upper_hsv, box_color, toggles.get(name, True))
 
         x = MARGIN
         y = top_h + MARGIN
@@ -654,6 +675,12 @@ def main():
         elif key == ord('s'):
             save_overrides(working)
             flash(f"Saved to {os.path.basename(OVERRIDE_PATH)}")
+
+        elif key == ord('x'):
+            new_state = color_toggles.toggle(name)
+            toggles = color_toggles.load_toggles()
+            flash(f"'{name}' is now {'ENABLED' if new_state else 'DISABLED'} for detection")
+            print(f"[hsv_tuner] {name} -> {'enabled' if new_state else 'disabled'}")
 
     cap.release()
     cv2.destroyAllWindows()
