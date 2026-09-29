@@ -120,6 +120,8 @@ PRETTY_LABEL = {
     "Stop Rad": "Stop Circle Radius",
     "Mask Pad": "Robot Mask Padding",
     "HeldMin x100": "Held Color Min % (x100)",
+    "Speed:Gem": "Drive Speed - hunting for a gem",
+    "Speed:Base": "Drive Speed - returning to base",
 }
 
 # ---- Python-side sliders: (label, min, max, default, config_name, scale) ----
@@ -134,16 +136,19 @@ PYTHON_SLIDERS = [
     ("Stop Rad", 10, 150, config.STOP_DISTANCE, "STOP_DISTANCE", 1),
     ("Mask Pad", 0, 150, config.ROBOT_MASK_PADDING, "ROBOT_MASK_PADDING", 1),
     ("HeldMin x100", 5, 60, int(config.GEM_COLOR_MIN_RATIO * 100), "GEM_COLOR_MIN_RATIO", 100),
+    # Manual two-speed drive (auto speed removed) - main.py pushes whichever
+    # of these matches the robot's current phase (not holding a gem vs
+    # holding one) to the ESP32's DRIVE_SPEED live, whenever that phase
+    # changes. Using getattr (not config.DRIVE_SPEED_GEM directly) so this
+    # works even before robot_overrides.json has ever had these keys.
+    ("Speed:Gem", 0, 255, getattr(config, "DRIVE_SPEED_GEM", 200), "DRIVE_SPEED_GEM", 1),
+    ("Speed:Base", 0, 255, getattr(config, "DRIVE_SPEED_BASE", 130), "DRIVE_SPEED_BASE", 1),
 ]
 
-# NOTE: there is no manual "gem speed" / "base speed" slider here any more -
-# main.py now computes drive speed fully automatically, from distance to
-# whatever it's approaching (see MAX_DRIVE_SPEED / MIN_DRIVE_SPEED /
-# SLOWDOWN_START_FACTOR at the top of navigation.py if you need to adjust
-# the auto ramp's ceiling, floor, or how early it starts slowing down).
-# The plain "Drive Speed" slider above still exists for this tuner's own
-# manual test-driving (i/j/k/l) - it has no effect once main.py is running,
-# since main.py overrides DRIVE_SPEED live with its own auto-computed value.
+# The plain "Drive Speed" slider above (in ESP32_SLIDERS) is still only for
+# this tuner's own manual test-driving (i/j/k/l) - it has no lasting effect
+# once main.py is running, since main.py pushes Speed:Gem / Speed:Base
+# live based on which phase the robot is in.
 
 
 def _nothing(_value):

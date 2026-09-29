@@ -94,32 +94,45 @@ class CommandSender:
         esp32_link.send_command(final_command, force=True)
 
 
-# ---- fully automatic drive speed ----------------------------------------
-# navigation.py now computes nav["drive_speed"] itself, purely from distance
-# to whatever's being approached (a gem OR a base) - there is no manual
-# "gem speed" / "base speed" to set here any more. main.py's only job is to
-# get that continuously-changing number to the ESP32 without flooding it
-# with HTTP requests: the speed is rounded to the nearest SPEED_PUSH_STEP
-# and only pushed when that rounded "bucket" actually changes, so a smooth
-# ramp still reaches the robot in reasonably fine steps without sending a
-# request every single frame.
-SPEED_PUSH_STEP = 10
+# ---- manual two-speed drive (auto speed removed) -------------------------
+# Back to plain manual speeds you set yourself - a different DRIVE_SPEED for
+# "hunting for a gem" vs. "hauling one back to a base". The ESP32 only
+# stores ONE drive speed at a time, so main.py pushes whichever of these
+# matches the current phase, but ONLY when the phase actually changes (not
+# continuously) - these are fixed numbers you tune, not an auto-computed
+# ramp. Adjust them with the "Speed:Gem" / "Speed:Base" sliders in
+# robot_config_tuner.py (saved to robot_overrides.json), or edit the
+# defaults below directly.
+DRIVE_SPEED_GEM = getattr(config, "DRIVE_SPEED_GEM", 200)     # searching for / approaching a gem
+DRIVE_SPEED_BASE = getattr(config, "DRIVE_SPEED_BASE", 130)   # hauling a held gem back to its base
 
-# Whenever the auto speed actually changes, force a brief full STOP before
-# resuming - a sudden speed change while already moving can jerk the robot
-# or throw off tracking for a frame or two, so pausing first makes each
-# speed change land cleanly instead of blending into the previous one.
-STOP_ON_SPEED_CHANGE_SEC = 0.3
 
-# Brief forced STOP whenever the movement DIRECTION actually reverses or
-# switches between turning and driving (e.g. LEFT -> FORWARD, FORWARD ->
-# BACKWARD, LEFT -> RIGHT) - not on every command change. Going to/from
-# STOP itself doesn't need this (the robot is already stationary either
-# way), so plain FORWARD <-> STOP <-> LEFT flips are unaffected and stay
-# instant; only a direct swap between two different movement directions
-# gets a brief settle pause first, which is where sudden direction flips
-# actually cause jitter/overshoot.
-DIRECTION_CHANGE_STOP_SEC = 0.2
+def push_drive_speed(speed):
+    """
+    Tell the ESP32 to use this DRIVE_SPEED from now on. Runs the HTTP
+    request in a short-lived background thread so a slow/flaky Wi-Fi link
+    never stalls the camera loop - only called when the phase changes, not
+    every frame.
+    """
+
+    def _send():
+        url = f"http://{config.ESP32_IP}:{config.ESP32_PORT}/config"
+        try:
+            requests.post(url, json={"drive_speed": int(speed)}, timeout=config.ESP32_REQUEST_TIMEOUT_SECONDS)
+            print(f"[main] Drive speed -> {speed}")
+        except requests.exceptions.RequestException as e:
+            print(f"[main] Failed to push drive speed {speed}: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+# ---- stop before every movement action ------------------------------------
+# Before the robot does ANY movement action (FORWARD/BACKWARD/LEFT/RIGHT),
+# it stops for this long first - every time the command actually changes,
+# with no exceptions (including coming from a real STOP). This trades a
+# little speed for a lot of stability: every action starts from a dead
+# stop instead of blending into whatever the robot was already doing.
+ACTION_CHANGE_STOP_SEC = 0.2
 
 # ---- grab-verify + retry (fix for a gem shoved behind the claw) ----------
 # A GRAB can miss - the gem was pushed out of position (see
@@ -139,26 +152,6 @@ GRAB_VERIFY_DELAY_SEC = 0.6
 GRAB_RETRY_BACKUP_SEC = 0.5
 
 
-def push_drive_speed(speed):
-    """
-    Tell the ESP32 to use this DRIVE_SPEED from now on. Runs the actual
-    HTTP request in a short-lived background thread so a slow/flaky
-    Wi-Fi link never stalls the camera loop - this is only called when
-    the phase actually changes (not every frame), so a handful of extra
-    threads over a run is not a concern.
-    """
-
-    def _send():
-        url = f"http://{config.ESP32_IP}:{config.ESP32_PORT}/config"
-        try:
-            requests.post(url, json={"drive_speed": int(speed)}, timeout=config.ESP32_REQUEST_TIMEOUT_SECONDS)
-            print(f"[main] Drive speed -> {speed}")
-        except requests.exceptions.RequestException as e:
-            print(f"[main] Failed to push drive speed {speed}: {e}")
-
-    threading.Thread(target=_send, daemon=True).start()
-
-
 def main():
 
     cap = cv2.VideoCapture(0)
@@ -176,14 +169,10 @@ def main():
     # Press 't' in the video window to forget them and re-detect.
     target_memory = TargetMemory()
 
-    # Fully automatic drive speed - tracks the last speed "bucket" actually
-    # sent to the ESP32, so we only push when it meaningfully changes (see
-    # SPEED_PUSH_STEP above).
-    last_speed_bucket = None
-
-    # While time.monotonic() is before this, the robot is forced to STOP
-    # regardless of what navigation wants - see STOP_ON_SPEED_CHANGE_SEC.
-    stop_until = 0.0
+    # Manual two-speed drive: start in "hunting for a gem" mode, since
+    # nothing is held at startup.
+    current_phase_speed = DRIVE_SPEED_GEM
+    push_drive_speed(current_phase_speed)
 
     # Grab-verify + retry state (see GRAB_VERIFY_DELAY_SEC above).
     # grab_verify_at: when to check whether the last GRAB actually worked,
@@ -194,11 +183,11 @@ def main():
     grab_verify_at = None
     backup_until = 0.0
 
-    # Direction-change settle pause (see DIRECTION_CHANGE_STOP_SEC above).
-    # last_direction_command: the last actual movement direction sent
-    # (FORWARD/BACKWARD/LEFT/RIGHT), or None right after a real STOP.
-    last_direction_command = None
-    direction_pause_until = 0.0
+    # Stop-before-every-action state (see ACTION_CHANGE_STOP_SEC above).
+    # last_sent_command: the last command actually sent (any of
+    # FORWARD/BACKWARD/LEFT/RIGHT/STOP), or None before anything is sent.
+    last_sent_command = None
+    action_pause_until = 0.0
 
     # Tracks whether the gripper was holding something last frame, so
     # GRAB/RELEASE only get sent once per pickup/placement — not on
@@ -389,40 +378,36 @@ def main():
                 sender.send_priority("RELEASE")
                 opened_this_cycle = True
 
-            # Decide the ACTUAL command to send this frame - this can
-            # override what navigation asked for with a forced STOP, either
-            # because of a recent speed change (STOP_ON_SPEED_CHANGE_SEC)
-            # or because the direction is about to reverse / switch between
-            # turning and driving (DIRECTION_CHANGE_STOP_SEC - see above).
+            # Decide the ACTUAL command to send this frame. Every time the
+            # command actually CHANGES - to anything, including going from
+            # a real STOP into a new movement - the robot is forced to
+            # STOP first for ACTION_CHANGE_STOP_SEC, then the new command
+            # takes over. This is deliberately blanket (every action gets
+            # a settle pause), not just reversals.
             desired_command = nav["nav_command"]
             now = time.monotonic()
 
             if desired_command == "STOP":
-                # A real STOP from navigation (arrived/idle) - nothing to
-                # settle away from, so the next movement won't be treated
-                # as a "reversal" just because it differs from whatever was
-                # last sent before this stop.
-                last_direction_command = None
+                # Stopping itself never needs a pre-pause.
+                last_sent_command = "STOP"
                 effective_command = "STOP"
 
-            elif now < stop_until or now < direction_pause_until:
+            elif now < action_pause_until:
                 effective_command = "STOP"
 
-            elif last_direction_command is not None and desired_command != last_direction_command:
-                # Direction actually changed (e.g. LEFT -> FORWARD) without
-                # passing through STOP first - pause briefly before applying
-                # it. Commit to the new direction NOW (even though the
-                # output this frame is still STOP) so that once the pause
-                # ends, the final "else" branch below sends it normally
-                # instead of re-detecting the same "change" forever and
-                # never actually leaving the pause state.
-                direction_pause_until = now + DIRECTION_CHANGE_STOP_SEC
-                last_direction_command = desired_command
+            elif last_sent_command is not None and desired_command != last_sent_command:
+                # The command just changed - pause first, then apply it.
+                # Commit to the new command NOW (even though the output
+                # this frame is still STOP) so that once the pause ends,
+                # the final "else" branch below sends it normally instead
+                # of re-detecting the same "change" forever.
+                action_pause_until = now + ACTION_CHANGE_STOP_SEC
+                last_sent_command = desired_command
                 effective_command = "STOP"
 
             else:
                 effective_command = desired_command
-                last_direction_command = desired_command
+                last_sent_command = desired_command
 
             sender.set_command(effective_command)
 
@@ -443,19 +428,12 @@ def main():
 
         is_holding = locked_held_color is not None
 
-        # Fully automatic speed: push the ESP32 the current auto-computed
-        # speed, but only while actually driving forward (turning/STOP don't
-        # use DRIVE_SPEED, so there's nothing to update for them), and only
-        # when it's moved to a new "bucket" so a smooth ramp doesn't turn
-        # into one HTTP request per frame.
-        if nav["nav_command"] == "FORWARD":
-            speed_bucket = round(nav["drive_speed"] / SPEED_PUSH_STEP) * SPEED_PUSH_STEP
-            if speed_bucket != last_speed_bucket:
-                push_drive_speed(speed_bucket)
-                last_speed_bucket = speed_bucket
-                # Force a brief STOP before resuming at the new speed,
-                # instead of changing speed while already moving.
-                stop_until = time.monotonic() + STOP_ON_SPEED_CHANGE_SEC
+        # Manual two-speed drive: push the matching fixed speed whenever the
+        # phase (holding a gem or not) actually changes - not continuously.
+        desired_phase_speed = DRIVE_SPEED_BASE if is_holding else DRIVE_SPEED_GEM
+        if desired_phase_speed != current_phase_speed:
+            push_drive_speed(desired_phase_speed)
+            current_phase_speed = desired_phase_speed
 
         # Reset the one-shot guards when the held/not-held state actually
         # flips, so the next pickup/placement can trigger GRAB/RELEASE again.

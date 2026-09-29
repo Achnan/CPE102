@@ -39,7 +39,10 @@ FORWARD_RELEASE_FACTOR = 1.5
 # distance instead of a multiple of PICKUP_DISTANCE, add
 # GRIPPER_PRE_OPEN_DISTANCE to config.py - it's read here if present and
 # overrides the factor.
-PRE_OPEN_DISTANCE_FACTOR = 2.5
+PRE_OPEN_DISTANCE_FACTOR = 1.4   # lowered from 2.5 - that made ready_to_open
+                                 # true for most of the approach, which felt
+                                 # like the claw was "always open". Now it only
+                                 # opens once genuinely close.
 
 # ---- stuck-in-a-turning-loop fix --------------------------------------------
 # Problem this fixes: when a gem is right at the edge of the gripper/claw,
@@ -98,26 +101,6 @@ def force_replan():
     """
     _clear_lock()
     _reset_stuck_tracking()
-
-# ---- fully automatic drive speed (no manual "gem speed" / "base speed") --
-# Speed is a continuous function of distance to whatever is currently being
-# approached - a gem OR a base, it doesn't matter which - so "runs too fast
-# on the way back to the base" is fixed the same way as "overshoots the
-# gem": both are just "too fast when close", and this slows down for BOTH
-# automatically, with no per-phase number to configure.
-#
-# MAX_DRIVE_SPEED: PWM used from SLOWDOWN_START_PX and beyond (far away).
-# MIN_DRIVE_SPEED: PWM used right at the pickup zone edge (close) - kept
-#   above the motor's real dead zone, or "auto" would ask for a speed that
-#   doesn't actually move the robot at all (same deadband problem turning
-#   already ran into - see TURN_DUTY_PERCENT on the ESP32 firmware).
-# SLOWDOWN_START_PX: distance at which deceleration begins; expressed as a
-#   multiple of PICKUP_DISTANCE so it scales automatically if you retune
-#   the pickup zone size, rather than being a second fixed number to keep
-#   in sync with it.
-MAX_DRIVE_SPEED = 220
-MIN_DRIVE_SPEED = 120
-SLOWDOWN_START_FACTOR = 6.0
 
 _steer = {"forwarding": False}
 
@@ -292,7 +275,6 @@ def compute_navigation(
         "ready_to_grab": False,
         "ready_to_place": False,
         "ready_to_open": False,
-        "drive_speed": MAX_DRIVE_SPEED,
     }
 
     # ------------------------------------------------------------------
@@ -509,12 +491,6 @@ def compute_navigation(
     )
 
     nav["gripper_distance"] = gripper_distance
-
-    # ---- fully automatic drive speed, based purely on distance ----
-    slowdown_start_px = config.PICKUP_DISTANCE * SLOWDOWN_START_FACTOR
-    span = max(1.0, slowdown_start_px - config.PICKUP_DISTANCE)
-    closeness = 1.0 - min(1.0, max(0.0, (gripper_distance - config.PICKUP_DISTANCE) / span))
-    nav["drive_speed"] = int(round(MAX_DRIVE_SPEED - closeness * (MAX_DRIVE_SPEED - MIN_DRIVE_SPEED)))
 
     # ==================================================================
     # Stuck-tracking bookkeeping - do this before the pickup-zone check so
