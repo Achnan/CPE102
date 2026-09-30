@@ -146,8 +146,8 @@ GEM_COLOR_MIN_RATIO = 0.15    # min fraction of sample area to call a color "hel
 # robot_config_tuner.py (press 'p' to save).
 # ============================================================
 
-DRIVE_SPEED_GEM = 200
-DRIVE_SPEED_BASE = 130
+DRIVE_SPEED_GEM = 170
+DRIVE_SPEED_BASE = 155
 
 
 # ============================================================
