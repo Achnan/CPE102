@@ -136,13 +136,12 @@ PYTHON_SLIDERS = [
     ("Stop Rad", 10, 150, config.STOP_DISTANCE, "STOP_DISTANCE", 1),
     ("Mask Pad", 0, 150, config.ROBOT_MASK_PADDING, "ROBOT_MASK_PADDING", 1),
     ("HeldMin x100", 5, 60, int(config.GEM_COLOR_MIN_RATIO * 100), "GEM_COLOR_MIN_RATIO", 100),
-    # Manual two-speed drive (auto speed removed) - main.py pushes whichever
-    # of these matches the robot's current phase (not holding a gem vs
-    # holding one) to the ESP32's DRIVE_SPEED live, whenever that phase
-    # changes. Using getattr (not config.DRIVE_SPEED_GEM directly) so this
-    # works even before robot_overrides.json has ever had these keys.
-    ("Speed:Gem", 0, 255, getattr(config, "DRIVE_SPEED_GEM", 200), "DRIVE_SPEED_GEM", 1),
-    ("Speed:Base", 0, 255, getattr(config, "DRIVE_SPEED_BASE", 130), "DRIVE_SPEED_BASE", 1),
+    # Manual two-speed drive - main.py pushes whichever of these matches the
+    # robot's current phase (not holding a gem vs holding one) to the
+    # ESP32's DRIVE_SPEED live, whenever that phase changes. Both are
+    # defined in config.py (and loaded from robot_overrides.json there).
+    ("Speed:Gem", 0, 255, config.DRIVE_SPEED_GEM, "DRIVE_SPEED_GEM", 1),
+    ("Speed:Base", 0, 255, config.DRIVE_SPEED_BASE, "DRIVE_SPEED_BASE", 1),
 ]
 
 # The plain "Drive Speed" slider above (in ESP32_SLIDERS) is still only for
@@ -386,7 +385,7 @@ def main():
     # reflects robot_overrides.json if one exists, since config.py loads
     # it on import) ----
     for label, _lo, _hi, _default, name, scale in PYTHON_SLIDERS:
-        cv2.setTrackbarPos(label, WINDOW, int(getattr(config, name) * scale))
+        cv2.setTrackbarPos(label, WINDOW, int(getattr(config, name, _default) * scale))
 
     print(__doc__)
 

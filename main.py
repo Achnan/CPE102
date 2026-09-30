@@ -9,6 +9,7 @@ import config
 import robot_tracker
 import vision
 import navigation
+import motion
 import drawing
 import esp32_link
 from target_memory import TargetMemory   # makes the base circles sticky
@@ -94,25 +95,22 @@ class CommandSender:
         esp32_link.send_command(final_command, force=True)
 
 
-# ---- manual two-speed drive (auto speed removed) -------------------------
-# Back to plain manual speeds you set yourself - a different DRIVE_SPEED for
-# "hunting for a gem" vs. "hauling one back to a base". The ESP32 only
-# stores ONE drive speed at a time, so main.py pushes whichever of these
-# matches the current phase, but ONLY when the phase actually changes (not
-# continuously) - these are fixed numbers you tune, not an auto-computed
-# ramp. Adjust them with the "Speed:Gem" / "Speed:Base" sliders in
-# robot_config_tuner.py (saved to robot_overrides.json), or edit the
-# defaults below directly.
-DRIVE_SPEED_GEM = getattr(config, "DRIVE_SPEED_GEM", 200)     # searching for / approaching a gem
-DRIVE_SPEED_BASE = getattr(config, "DRIVE_SPEED_BASE", 130)   # hauling a held gem back to its base
+# ---- manual two-speed drive -----------------------------------------------
+# A different DRIVE_SPEED for "hunting for a gem" vs. "hauling one back to a
+# base". The ESP32 stores ONE drive speed at a time, so this pushes the right
+# one whenever the phase changes. Tune with the "Speed:Gem" / "Speed:Base"
+# sliders in robot_config_tuner.py. motion.py measures how fast the robot
+# really drives and sizes its moves to match, so these can be set to what
+# the motors need to move reliably while carrying a gem.
+DRIVE_SPEED_GEM = config.DRIVE_SPEED_GEM
+DRIVE_SPEED_BASE = config.DRIVE_SPEED_BASE
 
 
 def push_drive_speed(speed):
     """
     Tell the ESP32 to use this DRIVE_SPEED from now on. Runs the HTTP
     request in a short-lived background thread so a slow/flaky Wi-Fi link
-    never stalls the camera loop - only called when the phase changes, not
-    every frame.
+    never stalls the camera loop - only called when the phase changes.
     """
 
     def _send():
@@ -126,30 +124,22 @@ def push_drive_speed(speed):
     threading.Thread(target=_send, daemon=True).start()
 
 
-# ---- stop before every movement action ------------------------------------
-# Before the robot does ANY movement action (FORWARD/BACKWARD/LEFT/RIGHT),
-# it stops for this long first - every time the command actually changes,
-# with no exceptions (including coming from a real STOP). This trades a
-# little speed for a lot of stability: every action starts from a dead
-# stop instead of blending into whatever the robot was already doing.
-ACTION_CHANGE_STOP_SEC = 0.2
-
-# ---- grab-verify + retry (fix for a gem shoved behind the claw) ----------
-# A GRAB can miss - the gem was pushed out of position (see
-# navigation.py's FINAL_APPROACH_FACTOR comment for the usual cause) and
-# the claw closes on nothing. Left alone, the robot would just keep re-
-# aiming at wherever that shoved gem now appears to be, pushing it further
-# every frame - the same loop the final-approach lock is meant to prevent,
-# but this catches it even if a bad grab still slips through.
+# ---- grab / place ---------------------------------------------------------
+# All movement timing (turn pulses, driving, stopping to look again, stuck
+# handling) now lives in motion.py. main.py only decides WHEN to grab or
+# release, and asks motion.py for the occasional back-up.
 #
-# Fix: after every GRAB, wait GRAB_VERIFY_DELAY_SEC for the claw to finish
-# closing and the camera to settle, then check whether held_gem_color
-# actually became non-None. If it's still empty, the grab failed - back
-# the robot up for GRAB_RETRY_BACKUP_SEC (so whatever's stuck near the
-# claw is freed) and drop the current target lock so the next attempt
-# re-evaluates from scratch instead of chasing the same shoved gem.
+# After every GRAB, wait GRAB_VERIFY_DELAY_SEC for the claw to close and the
+# camera to settle, then check whether something is really held. If not,
+# back up GRAB_RETRY_BACKUP_SEC, re-open the claw on the next approach, and
+# re-plan from scratch.
 GRAB_VERIFY_DELAY_SEC = 0.6
 GRAB_RETRY_BACKUP_SEC = 0.5
+
+# After releasing a gem on its base: wait for the claw to open, then back
+# away before turning, so the open claw doesn't sweep the gem off the base.
+RELEASE_OPEN_WAIT_SEC = 0.4
+POST_RELEASE_BACKUP_SEC = 0.4
 
 
 def main():
@@ -162,6 +152,7 @@ def main():
 
     aruco_detector = robot_tracker.make_detector()
     sender = CommandSender()
+    mover = motion.MotionController()
 
     # Remembers each color base by position and locks it in place once
     # seen long enough, so the robot driving on top of a base (and
@@ -169,63 +160,27 @@ def main():
     # Press 't' in the video window to forget them and re-detect.
     target_memory = TargetMemory()
 
-    # Manual two-speed drive: start in "hunting for a gem" mode, since
-    # nothing is held at startup.
     current_phase_speed = DRIVE_SPEED_GEM
     push_drive_speed(current_phase_speed)
 
-    # Grab-verify + retry state (see GRAB_VERIFY_DELAY_SEC above).
-    # grab_verify_at: when to check whether the last GRAB actually worked,
-    # or None if no GRAB is currently pending verification.
-    # backup_until: while time.monotonic() is before this, the robot is
-    # forced to BACKWARD (overrides everything else) to shake loose
-    # whatever's stuck near the claw after a failed grab.
+    # When to check whether the last GRAB actually picked something up.
     grab_verify_at = None
-    backup_until = 0.0
-
-    # Stop-before-every-action state (see ACTION_CHANGE_STOP_SEC above).
-    # last_sent_command: the last command actually sent (any of
-    # FORWARD/BACKWARD/LEFT/RIGHT/STOP), or None before anything is sent.
-    last_sent_command = None
-    action_pause_until = 0.0
-
-    # Tracks whether the gripper was holding something last frame, so
-    # GRAB/RELEASE only get sent once per pickup/placement — not on
-    # every single frame the robot happens to sit inside the zone.
-    was_holding = False
 
     # ---- held-color LOCK ------------------------------------------------
-    # Once a GRAB is verified to have actually picked something up, that
-    # gem's color is locked in and used for navigation/placement for as
-    # long as the robot is holding it - it does NOT depend on the camera
-    # still being able to see the gem's color while it's held (the claw
-    # usually covers most of it, so the raw camera reading is unreliable
-    # exactly while it matters most). The camera's held-color reading
-    # (held_gem_color, debounced above) is now used ONLY at the moment of
-    # verifying a GRAB - never while already holding something.
-    # None = not holding anything; a color name = holding that color,
-    # locked, regardless of what the camera currently sees.
+    # Once a GRAB is verified, that gem's colour is locked in and used until
+    # it is released - it does NOT depend on the camera still seeing the gem
+    # (the claw usually covers it). The camera reading is only used at the
+    # moment of verifying a GRAB.
     locked_held_color = None
+    was_holding = False
     grabbed_this_cycle = False
     placed_this_cycle = False
-
-    # Tracks whether the claw has already been pre-opened for the gem
-    # currently being approached, so RELEASE is only sent once per
-    # approach instead of every frame while inside the pre-open zone.
     opened_this_cycle = False
 
     # ---- held-color debounce -------------------------------------------
-    # A single frame of sample_color_at() at the grip spot is NOT trusted
-    # on its own - it can flicker (the robot's own frame/shadow, motion
-    # blur, partial occlusion), and since ready_to_open / ready_to_grab /
-    # ready_to_place / GRAB / RELEASE all depend on "are we holding
-    # something right now", a flickering raw reading makes the claw seem
-    # unsure whether it's holding or about to open. The raw reading must
-    # repeat for HOLD_CONFIRM_FRAMES frames in a row before it's trusted as
-    # "now holding X", and must be absent for HOLD_RELEASE_FRAMES frames in
-    # a row before it's trusted as "no longer holding" - only
-    # confirmed_held_color (not the raw reading) is ever passed to
-    # navigation or used to decide GRAB/RELEASE.
+    # A raw colour reading at the grip spot must repeat HOLD_CONFIRM_FRAMES
+    # frames in a row before it's trusted, and be absent HOLD_RELEASE_FRAMES
+    # in a row before it's dropped.
     HOLD_CONFIRM_FRAMES = 5
     HOLD_RELEASE_FRAMES = 5
     confirmed_held_color = None
@@ -245,6 +200,7 @@ def main():
 
         frame_count += 1
         should_log = (frame_count % LOG_EVERY_N_FRAMES == 0)
+        now = time.monotonic()
 
         height, width = image.shape[:2]
         result = image.copy()
@@ -263,16 +219,13 @@ def main():
             image, hsv_image, robot_info["roi"]
         )
 
-        # Swap this frame's raw detections for the remembered set (locked
-        # bases stay put even when hidden under the robot). This MUST come
-        # before assign_target_indices, which numbers the bases left->right
-        # - otherwise a hidden base would shift the numbering of the others.
+        # Remembered bases (locked ones stay put even when hidden under the
+        # robot). MUST come before assign_target_indices.
         detected_objects = target_memory.update(detected_objects)
 
         target_circles, _division_y = vision.assign_target_indices(detected_objects, height)
 
-        # A gem sitting inside a base is not a target to pick up (e.g. one
-        # the robot already placed there).
+        # A gem sitting inside a base is not a target to pick up.
         field_gems, ignored_gems = vision.split_gems_by_targets(field_gems, target_circles)
 
         # ---- held gem color, sampled from the pickup circle ----
@@ -284,8 +237,6 @@ def main():
                 config.GEM_SAMPLE_RADIUS
             )
 
-        # Debounce the raw reading before trusting it (see the comment
-        # where these variables are initialized, above the main loop).
         if raw_held_color is not None:
             _miss_streak = 0
             if raw_held_color == _candidate_color:
@@ -293,7 +244,6 @@ def main():
             else:
                 _candidate_color = raw_held_color
                 _candidate_streak = 1
-
             if _candidate_streak >= HOLD_CONFIRM_FRAMES:
                 confirmed_held_color = raw_held_color
         else:
@@ -305,9 +255,90 @@ def main():
 
         held_gem_color = confirmed_held_color
 
+        # ---- WHAT to go for (navigation) ----
+        nav = navigation.compute_navigation(
+            robot_info["center"], robot_info["heading_deg"], gripper_center,
+            locked_held_color, field_gems, target_circles
+        )
+
+        # ---- HOW to move there (motion) ----
+        pose = None
+        if robot_info["center"] is not None and robot_info["heading_deg"] is not None:
+            pose = (
+                float(robot_info["center"][0]),
+                float(robot_info["center"][1]),
+                float(robot_info["heading_deg"]) + getattr(config, "GRIPPER_ANGLE_OFFSET_DEG", 0),
+            )
+        move = mover.update(now, pose, nav)
+
+        if move["give_up"]:
+            print(f"[main] {move['note']}")
+            navigation.abandon_current_target()
+
+        # Grab/place when motion says the robot has arrived (it may also
+        # arrive when stuck but already close - see motion.py).
+        nav["ready_to_grab"] = move["arrived"] and locked_held_color is None
+        nav["ready_to_place"] = move["arrived"] and locked_held_color is not None
+        nav["nav_command"] = move["command"]
+
+        drawing.draw_navigation(
+            result, robot_info["center"], gripper_center, locked_held_color, nav
+        )
+
+        # ---- grab / place / drive ----
+        if nav["ready_to_grab"] and not grabbed_this_cycle:
+            sender.set_command("STOP")
+            sender.send_priority("GRAB")
+            grabbed_this_cycle = True
+            grab_verify_at = now + GRAB_VERIFY_DELAY_SEC
+
+        elif nav["ready_to_place"] and not placed_this_cycle:
+            sender.set_command("STOP")
+            sender.send_priority("RELEASE")
+            placed_this_cycle = True
+            print(f"[main] RELEASE sent - releasing locked color {locked_held_color}")
+            locked_held_color = None   # unlock: no longer holding anything
+            mover.request_backup(now, POST_RELEASE_BACKUP_SEC, delay=RELEASE_OPEN_WAIT_SEC)
+
+        else:
+            # Open the claw in advance, once per approach.
+            if nav["ready_to_open"] and not opened_this_cycle:
+                sender.send_priority("RELEASE")
+                opened_this_cycle = True
+            sender.set_command(move["command"])
+
+        # ---- did the GRAB we sent a moment ago actually pick something up? ----
+        if grab_verify_at is not None and now >= grab_verify_at:
+            grab_verify_at = None
+            if held_gem_color is not None:
+                locked_held_color = held_gem_color
+                print(f"[main] GRAB verified and locked -> holding {locked_held_color}")
+            else:
+                print("[main] GRAB did not pick anything up - backing up and retrying")
+                grabbed_this_cycle = False
+                opened_this_cycle = False   # re-open the claw on the next approach
+                navigation.force_replan()
+                mover.reset_target()
+                mover.request_backup(now, GRAB_RETRY_BACKUP_SEC)
+
+        is_holding = locked_held_color is not None
+
+        desired_phase_speed = DRIVE_SPEED_BASE if is_holding else DRIVE_SPEED_GEM
+        if desired_phase_speed != current_phase_speed:
+            push_drive_speed(desired_phase_speed)
+            current_phase_speed = desired_phase_speed
+
+        # Reset the one-shot guards when the held/not-held state flips.
+        if is_holding and not was_holding:
+            placed_this_cycle = False   # just picked up - ready to place next
+        if not is_holding and was_holding:
+            grabbed_this_cycle = False  # just placed/dropped - ready to grab next
+            opened_this_cycle = False   # ready to pre-open for the next gem too
+        was_holding = is_holding
+
+        # ---- logging ----
         if should_log:
             print(f"robot holding -> {locked_held_color} (camera currently reads: {held_gem_color})")
-
             if robot_info["center"] is not None:
                 print(
                     f"robot position -> "
@@ -316,139 +347,20 @@ def main():
                 )
             else:
                 print("robot position -> not detected")
-
-        # ---- navigation ----
-        # Uses locked_held_color (see above), NOT the raw held_gem_color -
-        # once holding something, what's actually held doesn't change just
-        # because the claw is currently blocking the camera's view of it.
-        nav = navigation.compute_navigation(
-            robot_info["center"], robot_info["heading_deg"], gripper_center,
-            locked_held_color, field_gems, target_circles
-        )
-
-        drawing.draw_navigation(
-            result, robot_info["center"], gripper_center, locked_held_color, nav
-        )
-
-        if should_log:
+            angle = nav["angle_diff"]
+            dist = nav["gripper_distance"]
             print(
-                f"nav command -> {nav['nav_command']} "
-                f"(aiming at: {nav['nav_target_label']}, angle_diff: {nav['angle_diff']}, "
-                f"ready_to_open: {nav['ready_to_open']}, "
-                f"ready_to_grab: {nav['ready_to_grab']}, ready_to_place: {nav['ready_to_place']})"
+                f"target -> {nav['nav_target_label']}"
+                f" (angle {angle:+.0f} deg, {dist:.0f}px)" if angle is not None else
+                f"target -> {nav['nav_target_label']}"
+            )
+            print(
+                f"motion -> {move['state']}: {move['note']} | sent {move['command']} | "
+                f"learned turn {mover.turn_rate:.0f} deg/s, drive {mover.drive_rate:.0f} px/s "
+                f"at speed {current_phase_speed}"
             )
 
-        # ========================================================
-        # SEND COMMAND TO ESP32 OVER WI-FI
-        #
-        # These calls are all non-blocking now: they just hand the
-        # command to CommandSender, which talks to the ESP32 from a
-        # background thread. The camera loop never waits on the
-        # network, so a slow or flaky Wi-Fi link no longer slows
-        # down frame capture. GRAB/RELEASE still go out ahead of the
-        # regular resend via send_priority(); the ESP32's 1.5s
-        # auto-stop is satisfied by the background thread's own
-        # resend timer, independent of frame rate.
-        # ========================================================
-
-        if time.monotonic() < backup_until:
-            # A grab just failed - back away first, ignoring everything
-            # else navigation might want to do this frame (see
-            # GRAB_RETRY_BACKUP_SEC above).
-            sender.set_command("BACKWARD")
-
-        elif nav["ready_to_grab"] and not grabbed_this_cycle:
-            sender.send_priority("GRAB")
-            grabbed_this_cycle = True
-            grab_verify_at = time.monotonic() + GRAB_VERIFY_DELAY_SEC
-
-        elif nav["ready_to_place"] and not placed_this_cycle:
-            sender.send_priority("RELEASE")
-            placed_this_cycle = True
-            print(f"[main] RELEASE sent - releasing locked color {locked_held_color}")
-            locked_held_color = None   # unlock: no longer holding anything
-
-        else:
-            # Pre-open the claw once, on the way in, before the robot is
-            # actually close enough to grab. This does NOT block driving:
-            # RELEASE is sent as a one-shot priority command (a brief pause
-            # on the ESP32 side while the servo moves), then the regular
-            # movement command below keeps being sent every frame as usual.
-            if nav["ready_to_open"] and not opened_this_cycle:
-                sender.send_priority("RELEASE")
-                opened_this_cycle = True
-
-            # Decide the ACTUAL command to send this frame. Every time the
-            # command actually CHANGES - to anything, including going from
-            # a real STOP into a new movement - the robot is forced to
-            # STOP first for ACTION_CHANGE_STOP_SEC, then the new command
-            # takes over. This is deliberately blanket (every action gets
-            # a settle pause), not just reversals.
-            desired_command = nav["nav_command"]
-            now = time.monotonic()
-
-            if desired_command == "STOP":
-                # Stopping itself never needs a pre-pause.
-                last_sent_command = "STOP"
-                effective_command = "STOP"
-
-            elif now < action_pause_until:
-                effective_command = "STOP"
-
-            elif last_sent_command is not None and desired_command != last_sent_command:
-                # The command just changed - pause first, then apply it.
-                # Commit to the new command NOW (even though the output
-                # this frame is still STOP) so that once the pause ends,
-                # the final "else" branch below sends it normally instead
-                # of re-detecting the same "change" forever.
-                action_pause_until = now + ACTION_CHANGE_STOP_SEC
-                last_sent_command = desired_command
-                effective_command = "STOP"
-
-            else:
-                effective_command = desired_command
-                last_sent_command = desired_command
-
-            sender.set_command(effective_command)
-
-        # Grab-verify: did the GRAB we sent a moment ago actually pick
-        # something up? This is the ONLY moment the raw camera reading
-        # (held_gem_color) is consulted - once it confirms a color, that
-        # color gets LOCKED in and the camera is no longer needed for it.
-        if grab_verify_at is not None and time.monotonic() >= grab_verify_at:
-            grab_verify_at = None
-            if held_gem_color is not None:
-                locked_held_color = held_gem_color
-                print(f"[main] GRAB verified and locked -> holding {locked_held_color}")
-            else:
-                print("[main] GRAB did not pick anything up - backing up and retrying")
-                grabbed_this_cycle = False
-                backup_until = time.monotonic() + GRAB_RETRY_BACKUP_SEC
-                navigation.force_replan()
-
-        is_holding = locked_held_color is not None
-
-        # Manual two-speed drive: push the matching fixed speed whenever the
-        # phase (holding a gem or not) actually changes - not continuously.
-        desired_phase_speed = DRIVE_SPEED_BASE if is_holding else DRIVE_SPEED_GEM
-        if desired_phase_speed != current_phase_speed:
-            push_drive_speed(desired_phase_speed)
-            current_phase_speed = desired_phase_speed
-
-        # Reset the one-shot guards when the held/not-held state actually
-        # flips, so the next pickup/placement can trigger GRAB/RELEASE again.
-        if is_holding and not was_holding:
-            placed_this_cycle = False   # just picked up - ready to place next
-
-        if not is_holding and was_holding:
-            grabbed_this_cycle = False  # just placed/dropped - ready to grab next
-            opened_this_cycle = False   # ready to pre-open for the next gem too
-
-        was_holding = is_holding
-
         # ---- draw field layout ----
-        # (the white center division line has been removed - draw_division_line
-        # no longer exists in drawing.py, so it is NOT called here)
         drawing.draw_field_boundary(result, height, width)
         drawing.draw_target_circles(result, target_circles)
         drawing.draw_field_gems(result, field_gems)
@@ -460,7 +372,6 @@ def main():
                 lock_note = "locked" if obj.get("locked") else "locking..."
                 print(f"target {obj['target_index']} ({side}) -> {obj['color']} [{lock_note}]")
             print()
-
             for gem in field_gems:
                 print(f"gem -> {gem['color']} at ({gem['center_x']}, {gem['center_y']})")
             if ignored_gems:

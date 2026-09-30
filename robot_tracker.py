@@ -111,6 +111,8 @@ def gripper_center_of(robot_info):
     if robot_info["center"] is None or robot_info["forward_unit"] is None:
         return None
 
+    # grip_tuner.py sets config.GRIPPER_ANGLE_OFFSET_DEG live, and config.py
+    # loads the saved value from robot_overrides.json on a normal run.
     angle_offset = getattr(config, "GRIPPER_ANGLE_OFFSET_DEG", 0.0)
     direction = robot_info["forward_unit"]
     if angle_offset:

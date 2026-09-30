@@ -112,6 +112,12 @@ FIELD_ROI_Y2_FRAC = 1.0
 # ============================================================
 
 GRIPPER_FORWARD_OFFSET = 80
+
+# Rotates the direction the offset above is measured in, away from the
+# robot's raw ArUco heading (degrees). Compensates for a top-view camera
+# mounted at a slight slant. Tuned live with grip_tuner.py.
+GRIPPER_ANGLE_OFFSET_DEG = 0
+
 PICKUP_RADIUS = 25
 PICKUP_DISTANCE = 25          # gem/target center must be within this to count
 
@@ -121,10 +127,27 @@ PICKUP_DISTANCE = 25          # gem/target center must be within this to count
 # gets close, instead of arriving with jaws still closed from the last
 # cycle and pushing the gem out of the way. Must stay bigger than
 # PICKUP_DISTANCE (open early, then close once truly aligned).
+# NOTE: navigation.py currently decides the pre-open zone from
+# PRE_OPEN_DISTANCE_FACTOR (x PICKUP_DISTANCE) unless
+# GRIPPER_PRE_OPEN_DISTANCE is defined - this value is not used by it.
 PICKUP_PREOPEN_DISTANCE = 70
 
 GEM_SAMPLE_RADIUS = PICKUP_RADIUS
 GEM_COLOR_MIN_RATIO = 0.15    # min fraction of sample area to call a color "held"
+
+
+# ============================================================
+# MANUAL DRIVE SPEEDS (0-255 PWM)
+# main.py pushes whichever matches the robot's current phase to the
+# ESP32 when the phase changes (picked up / placed a gem).
+#   DRIVE_SPEED_GEM  - hunting for / approaching a gem
+#   DRIVE_SPEED_BASE - hauling a held gem back to its base
+# Tune with the "Speed:Gem" / "Speed:Base" sliders in
+# robot_config_tuner.py (press 'p' to save).
+# ============================================================
+
+DRIVE_SPEED_GEM = 200
+DRIVE_SPEED_BASE = 130
 
 
 # ============================================================
@@ -170,8 +193,9 @@ TARGET_LOCK_MAX_DRIFT_PX = 40
 # If robot_overrides.json exists next to this file, it overrides the
 # pickup/navigation constants above (GRIPPER_FORWARD_OFFSET,
 # PICKUP_RADIUS, PICKUP_DISTANCE, TURN_ANGLE_THRESHOLD, STOP_DISTANCE,
-# ROBOT_MASK_PADDING, GEM_COLOR_MIN_RATIO). Re-tune any time by running
-# robot_config_tuner.py and pressing 's' - no code editing needed.
+# ROBOT_MASK_PADDING, GEM_COLOR_MIN_RATIO, drive speeds, ...). Re-tune
+# any time by running robot_config_tuner.py and pressing 's' - no code
+# editing needed.
 # ============================================================
 
 import json
@@ -183,11 +207,19 @@ _ROBOT_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 # or malicious JSON key silently creating/overwriting an unrelated
 # module attribute.
 _ROBOT_OVERRIDABLE_NAMES = {
-    "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
+    "GRIPPER_FORWARD_OFFSET", "GRIPPER_ANGLE_OFFSET_DEG",
+    "PICKUP_RADIUS", "PICKUP_DISTANCE",
     "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
     "GEM_COLOR_MIN_RATIO", "TARGET_LOCK_MAX_DRIFT_PX", "PICKUP_PREOPEN_DISTANCE",
+    "DRIVE_SPEED_GEM", "DRIVE_SPEED_BASE",
     "FIELD_ROI_X1_FRAC", "FIELD_ROI_Y1_FRAC", "FIELD_ROI_X2_FRAC", "FIELD_ROI_Y2_FRAC",
 }
+
+# Keys that legitimately live in robot_overrides.json but are read by
+# another module, not by this file - skipped silently instead of
+# printing an "unknown setting" warning.
+#   FIELD_ROI_POINTS - the click-point field polygon (field_area.py)
+_HANDLED_ELSEWHERE = {"FIELD_ROI_POINTS"}
 
 
 def _load_robot_overrides():
@@ -209,12 +241,17 @@ def _load_robot_overrides():
     # though the built-in default is an int - cast these back
     # explicitly regardless of what the JSON actually contained.
     _INT_NAMES = {
-        "GRIPPER_FORWARD_OFFSET", "PICKUP_RADIUS", "PICKUP_DISTANCE",
+        "GRIPPER_FORWARD_OFFSET", "GRIPPER_ANGLE_OFFSET_DEG",
+        "PICKUP_RADIUS", "PICKUP_DISTANCE",
         "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
         "TARGET_LOCK_MAX_DRIFT_PX", "PICKUP_PREOPEN_DISTANCE",
+        "DRIVE_SPEED_GEM", "DRIVE_SPEED_BASE",
     }
 
     for name, value in overrides.items():
+
+        if name in _HANDLED_ELSEWHERE:
+            continue
 
         if name not in _ROBOT_OVERRIDABLE_NAMES:
             print(f"[config] Warning: robot_overrides.json has unknown setting '{name}', skipping.")
