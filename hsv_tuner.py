@@ -40,6 +40,16 @@ Note: an eyedropper click REPLACES all ranges of the selected color
 (it recalculates from your clicked samples). Slider tweaks made after
 a click are kept until your next click.
 
+EXCLUDING (new): a range is a box - one min and one max for each of H, S and V -
+so the only way to drop a wrongly detected thing is to raise a min or lower a
+max. The tuner looks at the pixels of what you clicked, tries every channel and
+side, and puts the new limit in the MIDDLE of the gap between that thing and your
+good clicks, on the channel where the gap is widest (a cut that barely squeezes
+between them would lose the gem when the light changes). The footer says what it
+did. If that thing looks the same as your good clicks it says so and changes
+nothing - lower "Pick tol SV" or click a cleaner good sample instead. Exclusions
+are kept when you add more good clicks, and cleared when you switch colour.
+
 Controls:
     Click a color button at the top   - pick which color you're tuning
     n / p                             - same thing, next / previous color
@@ -55,8 +65,14 @@ Controls:
                                          you turn it back on here; its saved HSV ranges
                                          are untouched, so you can still tune it while
                                          it's off and re-enable it once it's fixed)
-    u                                 - eyedropper: undo the last click
-    r                                 - eyedropper: forget all clicks (next click starts fresh)
+    m                                 - EXCLUDE mode (eyedropper must be on, and you need at least
+                                         one good click first). Click something that is being
+                                         detected but should NOT be (a robot part, a neighbouring
+                                         colour): the range is narrowed so that thing drops out
+                                         while every good click stays. Press m again to go back
+                                         to adding. See "EXCLUDING" below.
+    u                                 - eyedropper: undo the last click (in exclude mode: the last exclusion)
+    r                                 - eyedropper: forget all clicks AND exclusions (next click starts fresh)
     s                                 - save ALL colors' current ranges to hsv_overrides.json
     q / ESC                           - quit without saving further changes
 """
@@ -195,6 +211,168 @@ def ranges_from_samples(samples, tol_h, tol_sv):
 
 
 # ------------------------------------------------------------------ #
+# Exclusion helpers
+# ------------------------------------------------------------------ #
+
+# ---- exclusion: narrow a colour range so a wrongly-detected blob drops out ----------------------
+EXCLUDE_FULL_FRACTION = 0.95   # a cut that removes at least this much of the blob counts as "clean"
+EXCLUDE_MIN_USEFUL = 0.6       # a partial cut must remove at least this much; below it the blob looks too much like your good clicks
+BLOB_MAX_PIXELS = 6000         # a huge blob is sub-sampled to this many pixels
+_CHANNEL = "HSV"               # channel index -> name
+_SCALE = (179.0, 255.0, 255.0) # how big each channel is, to compare gaps between channels fairly
+_MIN_GAP = (2, 8, 8)           # a cut needs at least this much room between the blob and your clicks
+
+
+def _inside(points, lower, upper):
+    """Boolean mask of the rows of `points` (N x 3) lying inside the box [lower, upper]."""
+    points = np.asarray(points)
+    return np.all((points >= np.asarray(lower)) & (points <= np.asarray(upper)), axis=1)
+
+
+def cut_blob_out(ranges, blob, kept):
+    """
+    Narrow the HSV ranges so the pixels of `blob` (N x 3, the wrongly detected
+    thing) stop matching, while EVERY point in `kept` (your good clicks) still
+    matches.
+
+    A range is a box: one min and one max per channel, so the only possible edit
+    is to raise a min or lower a max, slicing a slab off one side of the box.
+    For each range holding part of the blob, every channel and side is tried:
+
+      * If the blob and your clicks are separated on that channel (there is a
+        gap between them of at least _MIN_GAP), the new limit goes in the MIDDLE
+        of the gap, so both sides keep as much room as possible against lighting
+        changes. Of all such cuts the one with the WIDEST gap (relative to the
+        channel's size) wins - a cut that barely squeezes between them would
+        lose the gem as soon as the light shifts. Ties prefer H, S, V in that order.
+      * If nothing separates cleanly, the best partial cut is used: the limit goes
+        HALFWAY between the old limit and your nearest good click (so half the
+        original margin survives instead of hugging your click), and it is only
+        used if it still removes at least EXCLUDE_MIN_USEFUL of the blob. The
+        result is flagged PARTIAL.
+
+    Returns (new_ranges, message) on success, or (None, message). `ranges` is
+    not modified.
+    """
+
+    blob = np.asarray(blob, dtype=int)
+    kept = np.asarray(kept, dtype=int).reshape(-1, 3)
+    new_ranges = [[list(lo), list(hi)] for lo, hi in ranges]
+    notes, all_clean, touched, to_drop = [], True, 0, []
+
+    for index, (lower, upper) in enumerate(new_ranges):
+        in_blob = blob[_inside(blob, lower, upper)]
+        if len(in_blob) == 0:
+            continue
+        touched += 1
+        good = kept[_inside(kept, lower, upper)]
+
+        if len(good) == 0:
+            # none of your good clicks live in this piece of the range, so the
+            # whole piece is unnecessary (e.g. the far side of red's 0/179 wrap)
+            to_drop.append(index)
+            notes.append(f"removed range {index + 1} (none of your good clicks are in it)")
+            continue
+
+        clean, partial = [], []
+        for ch in range(3):
+            values = in_blob[:, ch]
+
+            # --- raise the minimum: everything BELOW the new min is cut ---
+            blob_edge = int(np.percentile(values, 95))        # top of the blob (ignoring its top 5%)
+            kept_edge = int(good[:, ch].min())                # lowest value you want to keep
+            if blob_edge + 1 + _MIN_GAP[ch] <= kept_edge:
+                t = (blob_edge + 1 + kept_edge) // 2
+                if t > lower[ch]:
+                    clean.append(((kept_edge - blob_edge) / _SCALE[ch], ch, "min", t,
+                                  float(np.mean(values < t)), kept_edge - t))
+            elif kept_edge > lower[ch]:
+                t = lower[ch] + (kept_edge - lower[ch]) // 2
+                if t > lower[ch]:
+                    partial.append((float(np.mean(values < t)), ch, "min", t, kept_edge - t))
+
+            # --- lower the maximum: everything ABOVE the new max is cut ---
+            blob_edge = int(np.percentile(values, 5))         # bottom of the blob (ignoring its bottom 5%)
+            kept_edge = int(good[:, ch].max())                # highest value you want to keep
+            if kept_edge + _MIN_GAP[ch] + 1 <= blob_edge:
+                t = (kept_edge + blob_edge) // 2
+                if t < upper[ch]:
+                    clean.append(((blob_edge - kept_edge) / _SCALE[ch], ch, "max", t,
+                                  float(np.mean(values > t)), t - kept_edge))
+            elif kept_edge < upper[ch]:
+                t = kept_edge + (upper[ch] - kept_edge) // 2
+                if t < upper[ch]:
+                    partial.append((float(np.mean(values > t)), ch, "max", t, t - kept_edge))
+
+        if clean:
+            widest = max(c[0] for c in clean)
+            gap, ch, side, t, fraction, room = min(
+                (c for c in clean if c[0] >= widest - 0.02), key=lambda c: c[1])   # near-ties: H, S, V
+            verb = f"raised {_CHANNEL[ch]} min to {t}" if side == "min" else f"lowered {_CHANNEL[ch]} max to {t}"
+            where = "above" if side == "min" else "below"     # your clicks sit on the KEPT side of the cut
+            note = f"{verb} (removes {100 * fraction:.0f}% of that blob; your clicks keep a margin of {room} {where} it)"
+        elif partial and max(p[0] for p in partial) >= EXCLUDE_MIN_USEFUL:
+            fraction, ch, side, t, room = max(partial, key=lambda p: (round(p[0], 3), -p[1]))
+            verb = f"raised {_CHANNEL[ch]} min to {t}" if side == "min" else f"lowered {_CHANNEL[ch]} max to {t}"
+            note = f"{verb} (removes only {100 * fraction:.0f}% - the rest looks like your clicks)"
+            all_clean = False
+        else:
+            best = max((p[0] for p in partial), default=0.0)
+            notes.append(f"range {index + 1}: only {100 * best:.0f}% of that blob can be cut without losing a good click")
+            all_clean = False
+            continue
+
+        if side == "min":
+            lower[ch] = t
+        else:
+            upper[ch] = t
+        notes.append(note)
+
+    if touched == 0:
+        return None, "that blob is not inside the current range - nothing to cut"
+
+    survivors = [r for i, r in enumerate(new_ranges) if i not in to_drop]
+    if not survivors:
+        return None, "none of your good clicks are inside the range - click the colour you want first"
+
+    unchanged = not to_drop and all(r == [list(lo), list(hi)] for r, (lo, hi) in zip(new_ranges, ranges))
+    if unchanged:
+        return None, ("can't exclude it: it looks the same as your good clicks ("
+                      + "; ".join(notes) + "). Lower 'Pick tol SV', or click a cleaner good sample")
+
+    message = "Excluded: " + "; ".join(notes) + f" | all {len(kept)} good click{'s' if len(kept) != 1 else ''} kept"
+    if not all_clean:
+        message += " | PARTIAL - click more of it, or lower 'Pick tol'"
+    return survivors, message
+
+
+def blob_near_click(mask, hsv, fx, fy, radius=14):
+    """
+    HSV pixels (N x 3) of the detected blob under (fx, fy): the connected piece
+    of `mask` containing that point, limited to `radius` px around it so a blob
+    that also touches something you DO want doesn't get mixed in. None if the
+    click is not on anything currently detected.
+    """
+
+    if mask[fy, fx] == 0:
+        return None
+
+    _count, labels = cv2.connectedComponents(mask)
+    same_blob = labels == labels[fy, fx]
+
+    h, w = mask.shape[:2]
+    y0, y1, x0, x1 = max(0, fy - radius), min(h, fy + radius + 1), max(0, fx - radius), min(w, fx + radius + 1)
+    window = np.zeros_like(same_blob)
+    window[y0:y1, x0:x1] = True
+
+    ys, xs = np.nonzero(same_blob & window)
+    if len(ys) > BLOB_MAX_PIXELS:
+        keep = np.linspace(0, len(ys) - 1, BLOB_MAX_PIXELS).astype(int)
+        ys, xs = ys[keep], xs[keep]
+    return hsv[ys, xs].astype(int)
+
+
+# ------------------------------------------------------------------ #
 # Drawing helpers
 # ------------------------------------------------------------------ #
 
@@ -321,7 +499,7 @@ def draw_footer(canvas, y0, flash_message=None, flash_color=SAVE_FLASH_COLOR):
     if flash_message:
         text, color = flash_message, flash_color
     else:
-        text = "click/n/p color | [ ] range | +/- range | e eyedropper | x on/off | s save | q quit"
+        text = "click/n/p color | [ ] range | +/- range | e eyedropper | m exclude | x on/off | s save | q quit"
         color = MUTED_TEXT
 
     cv2.putText(canvas, text, (10, y0 + FOOTER_HEIGHT - 9), FONT, 0.48, color, 1, cv2.LINE_AA)
@@ -392,6 +570,9 @@ def main():
         "samples": [],           # (h, s, v) of every click for the selected color
         "sample_points": [],     # (x, y) in camera-frame pixels, for the on-screen markers
         "last_hsv": None,        # the latest frame's HSV image (what clicks sample from)
+        "last_mask": None,       # the latest cleaned mask (what "exclude" clicks look at)
+        "mode": "add",           # eyedropper click mode: "add" a good colour or "exclude" a wrong one
+        "exclusions": [],        # [{"blob": N x 3 HSV pixels, "point": (x, y)}] for the selected colour
         "camera_panel": None,    # (canvas_x, canvas_y, scale) of the camera panel, for click mapping
     }
 
@@ -408,6 +589,8 @@ def main():
     def reset_samples():
         state["samples"] = []
         state["sample_points"] = []
+        state["exclusions"] = []
+        state["mode"] = "add"
 
     def apply_samples():
         """Recompute the selected color's ranges from ALL clicked samples."""
@@ -419,13 +602,26 @@ def main():
         tol_h = cv2.getTrackbarPos("Pick tol H", WINDOW_NAME)
         tol_sv = cv2.getTrackbarPos("Pick tol SV", WINDOW_NAME)
 
-        working[name]["ranges"] = ranges_from_samples(state["samples"], tol_h, tol_sv)
+        new_ranges = ranges_from_samples(state["samples"], tol_h, tol_sv)
+
+        # clicks recompute the range from scratch, so put every exclusion back
+        lost = 0
+        for exclusion in state["exclusions"]:
+            cut, _message = cut_blob_out(new_ranges, exclusion["blob"], state["samples"])
+            if cut is None:
+                lost += 1
+            else:
+                new_ranges = cut
+
+        working[name]["ranges"] = new_ranges
         state["range_index"] = 0
         push_sliders_from_state()
 
         n = len(state["samples"])
         extra = " (wraps 0/179 - 2 ranges)" if len(working[name]["ranges"]) > 1 else ""
-        flash(f"Eyedropper: '{name}' set from {n} click{'s' if n != 1 else ''}{extra}")
+        excl = f", {len(state['exclusions']) - lost} exclusion(s) re-applied" if state["exclusions"] else ""
+        warn = f" - {lost} exclusion(s) no longer possible" if lost else ""
+        flash(f"Eyedropper: '{name}' set from {n} click{'s' if n != 1 else ''}{extra}{excl}{warn}")
 
     def eyedropper_click(x, y):
         hsv = state["last_hsv"]
@@ -449,6 +645,44 @@ def main():
         state["sample_points"].append((fx, fy))
         apply_samples()
 
+    def exclude_click(x, y):
+        """Click on something detected that should NOT be: narrow the range so it drops out."""
+        hsv = state["last_hsv"]
+        mask = state["last_mask"]
+        layout = state["camera_panel"]
+        if hsv is None or mask is None or layout is None:
+            return
+
+        if not state["samples"]:
+            flash("Exclude needs a good click first: press m, click the colour you WANT, then m again")
+            return
+
+        x0, y0, scale = layout
+        fx = int((x - x0) / scale)
+        fy = int((y - y0) / scale)
+        h_img, w_img = hsv.shape[:2]
+        if not (0 <= fx < w_img and 0 <= fy < h_img):
+            return
+
+        blob = blob_near_click(mask, hsv, fx, fy)
+        if blob is None:
+            flash("That spot is not being detected right now - nothing to exclude", 2.5)
+            return
+
+        name = color_names[state["color_index"]]
+        new_ranges, message = cut_blob_out(working[name]["ranges"], blob, state["samples"])
+        if new_ranges is None:
+            flash(message[0].upper() + message[1:], 4.0)
+            print(f"[hsv_tuner] {name}: {message}")
+            return
+
+        working[name]["ranges"] = new_ranges
+        state["range_index"] = min(state["range_index"], len(new_ranges) - 1)
+        push_sliders_from_state()
+        state["exclusions"].append({"blob": blob, "point": (fx, fy)})
+        flash(message, 4.0)
+        print(f"[hsv_tuner] {name}: {message}")
+
     def on_mouse(event, x, y, flags, _param):
         if event == cv2.EVENT_MOUSEMOVE:
             state["hover_index"] = button_index_for_click(x, y, canvas_width, len(color_names))
@@ -466,7 +700,10 @@ def main():
             return
 
         if state["eyedropper"]:
-            eyedropper_click(x, y)
+            if state["mode"] == "exclude":
+                exclude_click(x, y)
+            else:
+                eyedropper_click(x, y)
 
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
@@ -531,6 +768,8 @@ def main():
             mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
         mask = vision.clean_mask(mask)
 
+        state["last_mask"] = mask   # exclude clicks look at what is detected right now
+
         result = cv2.bitwise_and(frame, frame, mask=mask)
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
@@ -551,10 +790,17 @@ def main():
             cv2.circle(camera_view, (px, py), SAMPLE_RADIUS + 4, (0, 0, 0), 1)
             cv2.putText(camera_view, str(i), (px + 10, py - 8), FONT, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
 
+        # red crosses where something was excluded
+        for (px, py) in [e["point"] for e in state["exclusions"]]:
+            cv2.line(camera_view, (px - 9, py - 9), (px + 9, py + 9), (0, 0, 255), 3)
+            cv2.line(camera_view, (px - 9, py + 9), (px + 9, py - 9), (0, 0, 255), 3)
+
         # ---- assemble the single combined canvas ----
         top_h = BUTTON_ROW_HEIGHT + INFO_BAR_HEIGHT
 
-        if state["eyedropper"]:
+        if state["eyedropper"] and state["mode"] == "exclude":
+            camera_label, camera_label_color = "CAMERA - EXCLUDE: click the wrong part", (0, 0, 255)
+        elif state["eyedropper"]:
             camera_label, camera_label_color = "CAMERA - EYEDROPPER ON: click the object", (0, 255, 0)
         else:
             camera_label, camera_label_color = "CAMERA + DETECTIONS", ACCENT
@@ -596,11 +842,17 @@ def main():
         footer_message, footer_color = None, SAVE_FLASH_COLOR
         if state["flash_message"] and time.time() < state["flash_until"]:
             footer_message = state["flash_message"]
+        elif state["eyedropper"] and state["mode"] == "exclude":
+            footer_message = (
+                f"EXCLUDE: click something wrongly detected ({len(state['exclusions'])} done) "
+                f"| u undo | r restart | m back to adding"
+            )
+            footer_color = (90, 90, 255)
         elif state["eyedropper"]:
             n = len(state["samples"])
             footer_message = (
                 f"EYEDROPPER: click '{name}' on the CAMERA panel ({n} click{'s' if n != 1 else ''}) "
-                f"- more clicks widen | u undo | r restart | e off"
+                f"- more clicks widen | m exclude | u undo | r restart | e off"
             )
             footer_color = ACCENT
         draw_footer(canvas, canvas_h - FOOTER_HEIGHT, flash_message=footer_message, flash_color=footer_color)
@@ -657,6 +909,27 @@ def main():
             flash("Eyedropper ON - click the object in the CAMERA panel"
                   if state["eyedropper"] else "Eyedropper OFF")
 
+        elif key == ord('m'):
+            if state["mode"] == "add":
+                if not state["eyedropper"]:
+                    state["eyedropper"] = True
+                    reset_samples()
+                state["mode"] = "exclude"
+                flash("EXCLUDE mode: click something detected that should NOT be (press m to go back)"
+                      if state["samples"] else
+                      "EXCLUDE mode - but first click the colour you WANT (press m, click it, m again)", 3.0)
+            else:
+                state["mode"] = "add"
+                flash("Back to ADD mode - click the colour you want")
+
+        elif key == ord('u') and state["mode"] == "exclude":
+            if state["exclusions"]:
+                state["exclusions"].pop()
+                apply_samples()
+                flash(f"Last exclusion undone ({len(state['exclusions'])} left)")
+            else:
+                flash("No exclusion to undo")
+
         elif key == ord('u'):
             if state["samples"]:
                 state["samples"].pop()
@@ -670,7 +943,7 @@ def main():
 
         elif key == ord('r'):
             reset_samples()
-            flash("Eyedropper: clicks cleared - next click starts fresh")
+            flash("Eyedropper: clicks and exclusions cleared - next click starts fresh")
 
         elif key == ord('s'):
             save_overrides(working)

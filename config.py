@@ -118,8 +118,23 @@ GRIPPER_FORWARD_OFFSET = 80
 # mounted at a slight slant. Tuned live with grip_tuner.py.
 GRIPPER_ANGLE_OFFSET_DEG = 0
 
+# ---- the two gripper areas (both sized and placed in grip_tuner.py) --------
+#
+#  HOLD area  - centre GRIPPER_FORWARD_OFFSET, radius PICKUP_RADIUS.
+#               Where a gem must be when the claw closes. The colour of what
+#               is inside it tells whether something is held, so keep it
+#               close to the gem's own size (a circle much bigger than the gem
+#               makes the gem fill so little of it that the reading flickers).
+#  TIP area   - centre GRIPPER_TIP_OFFSET, radius GRIPPER_TIP_RADIUS.
+#               The claw's front end. For now it is only drawn and saved by
+#               grip_tuner.py - the robot's movement does not use it yet.
+#
+# PICKUP_DISTANCE is how close the gem must be to the hold centre to count as
+# "arrived" (grab). Keep it about the hold radius plus a little.
 PICKUP_RADIUS = 25
 PICKUP_DISTANCE = 25          # gem/target center must be within this to count
+GRIPPER_TIP_OFFSET = 105      # centre of the tip area, measured from the robot centre
+GRIPPER_TIP_RADIUS = 30
 
 # While approaching a gem (not holding anything yet), the gripper opens
 # proactively once the gem is within THIS distance - wider than
@@ -135,6 +150,12 @@ PICKUP_PREOPEN_DISTANCE = 70
 GEM_SAMPLE_RADIUS = PICKUP_RADIUS
 GEM_COLOR_MIN_RATIO = 0.15    # min fraction of sample area to call a color "held"
 
+# A loose gem counts as ON a base when it is within (base radius x this) of the base's centre.
+# Raise it if gems resting near the rim of a base are not counted as on it; lower it if gems
+# lying just OUTSIDE a base are wrongly ignored. 1.0 = exactly the circle drawn on screen.
+# (Adjustable with the "BaseRim x100" slider in robot_config_tuner.py.)
+BASE_EXCLUDE_MARGIN = 1.25
+
 
 # ============================================================
 # MANUAL DRIVE SPEEDS (0-255 PWM)
@@ -146,8 +167,8 @@ GEM_COLOR_MIN_RATIO = 0.15    # min fraction of sample area to call a color "hel
 # robot_config_tuner.py (press 'p' to save).
 # ============================================================
 
-DRIVE_SPEED_GEM = 170
-DRIVE_SPEED_BASE = 155
+DRIVE_SPEED_GEM = 200
+DRIVE_SPEED_BASE = 130
 
 
 # ============================================================
@@ -208,10 +229,11 @@ _ROBOT_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 # module attribute.
 _ROBOT_OVERRIDABLE_NAMES = {
     "GRIPPER_FORWARD_OFFSET", "GRIPPER_ANGLE_OFFSET_DEG",
+    "GRIPPER_TIP_OFFSET", "GRIPPER_TIP_RADIUS",
     "PICKUP_RADIUS", "PICKUP_DISTANCE",
     "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
     "GEM_COLOR_MIN_RATIO", "TARGET_LOCK_MAX_DRIFT_PX", "PICKUP_PREOPEN_DISTANCE",
-    "DRIVE_SPEED_GEM", "DRIVE_SPEED_BASE",
+    "DRIVE_SPEED_GEM", "DRIVE_SPEED_BASE", "BASE_EXCLUDE_MARGIN",
     "FIELD_ROI_X1_FRAC", "FIELD_ROI_Y1_FRAC", "FIELD_ROI_X2_FRAC", "FIELD_ROI_Y2_FRAC",
 }
 
@@ -242,6 +264,7 @@ def _load_robot_overrides():
     # explicitly regardless of what the JSON actually contained.
     _INT_NAMES = {
         "GRIPPER_FORWARD_OFFSET", "GRIPPER_ANGLE_OFFSET_DEG",
+        "GRIPPER_TIP_OFFSET", "GRIPPER_TIP_RADIUS",
         "PICKUP_RADIUS", "PICKUP_DISTANCE",
         "TURN_ANGLE_THRESHOLD", "STOP_DISTANCE", "ROBOT_MASK_PADDING",
         "TARGET_LOCK_MAX_DRIFT_PX", "PICKUP_PREOPEN_DISTANCE",

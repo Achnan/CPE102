@@ -12,7 +12,7 @@ import color_toggles
 # pick up. Two checks catch it:
 #  - inside a detected base circle, grown by this factor to cover the
 #    base's white rim (see split_gems_by_targets)
-BASE_EXCLUDE_MARGIN = 1.25
+BASE_EXCLUDE_MARGIN = 1.25      # fallback only: config.BASE_EXCLUDE_MARGIN (tunable) is what is used
 #  - inside ANY big colored blob (a base that wasn't recognized as a clean
 #    circle, e.g. half hidden by the robot). Only blobs up to this many times
 #    TARGET_AREA_FRACTION count, so a huge floor-colored area can't hide
@@ -319,7 +319,7 @@ def split_gems_by_targets(field_gems, target_circles):
                 radius = ((target["x2"] - target["x1"]) + (target["y2"] - target["y1"])) / 4.0
 
                 distance = math.hypot(gem["center_x"] - cx, gem["center_y"] - cy)
-                if distance <= radius * BASE_EXCLUDE_MARGIN + gem_half:
+                if distance <= radius * getattr(config, "BASE_EXCLUDE_MARGIN", BASE_EXCLUDE_MARGIN) + gem_half:
                     on_a_base = True
                     break
 

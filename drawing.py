@@ -32,6 +32,16 @@ def draw_pickup_circle(result, gripper_center):
     cv2.circle(result, (gx, gy), 4, (255, 0, 255), -1)
 
 
+def draw_tip_circle(result, tip_center):
+    """The TIP area (cyan): the claw's front end. Drawn by grip_tuner.py."""
+    if tip_center is None:
+        return
+    tx, ty = int(tip_center[0]), int(tip_center[1])
+    radius = getattr(config, "GRIPPER_TIP_RADIUS", 30)
+    cv2.circle(result, (tx, ty), radius, (255, 220, 0), 2)
+    cv2.circle(result, (tx, ty), 4, (255, 220, 0), -1)
+
+
 def draw_field_boundary(result, height, width):
     """Draw the field area so it's visible where detection is
     restricted to - anything outside it (like a wall) is excluded from
@@ -128,11 +138,16 @@ def draw_navigation(result, robot_center, gripper_center, held_gem_color, nav):
     tx, ty = nav["nav_target_point"]
     ready = nav["ready_to_grab"] or nav["ready_to_place"]
 
+    # main_two_area.py puts the claw-tip position in nav["tip_center"]; main.py
+    # (one area) does not. The two versions label and draw a little differently.
+    two_area = nav.get("tip_center") is not None
+
     # NEW: the pre-open zone (only meaningful while chasing a GEM, i.e. not
     # holding one yet) - a lighter, thinner circle drawn OUTSIDE the pickup
     # circle, so you can see the moment the claw is told to open, before
-    # the robot actually reaches the gem.
-    if held_gem_color is None and not ready:
+    # the robot actually reaches the gem. (One-area version only: the two-area
+    # version opens the claw from the tip circle instead.)
+    if held_gem_color is None and not ready and not two_area:
         pre_open_radius = getattr(
             config, "GRIPPER_PRE_OPEN_DISTANCE",
             config.PICKUP_DISTANCE * PRE_OPEN_DISTANCE_FACTOR
@@ -143,7 +158,8 @@ def draw_navigation(result, robot_center, gripper_center, held_gem_color, nav):
     label = (
         "PICK!" if nav["ready_to_grab"] else
         "PLACE!" if nav["ready_to_place"] else
-        "OPEN!" if (held_gem_color is None and nav["ready_to_open"]) else
+        "OPENING..." if nav.get("nav_state") == "OPENING" else
+        "OPEN!" if (not two_area and held_gem_color is None and nav["ready_to_open"]) else
         "HOLDING" if held_gem_color else
         "PICKUP"
     )

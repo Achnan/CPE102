@@ -1,5 +1,5 @@
 """
-motion.py - decides HOW the robot moves toward the target navigation.py chose.
+motion_two_area.py (TWO-area version of motion.py) - decides HOW the robot moves toward the target navigation.py chose.
 
 It is the ONLY place that decides movement timing. The idea is "move, stop,
 look again":
@@ -13,25 +13,36 @@ look again":
 Why this instead of turning continuously until the angle is small: the
 camera and Wi-Fi add delay, so a continuous turn always overshoots, turns
 back, overshoots again. Sizing each pulse from a measured angle and then
-looking again converges in a few steps with no overshoot loop. It also makes
-"stop before every action" part of the design instead of a patch on top.
+looking again converges in a few steps with no overshoot loop.
 
-Self-calibration: nobody knows exactly how many degrees the robot turns per
-second at your Turn Speed / Turn Duty, or how many pixels per second it
-drives at your drive speed - and both change with battery level. After every
-pulse/hop, the controller measures what really happened and updates its
-estimate, so later pulses get the size right. It starts by assuming the
-robot is FAST, so the first pulses are short and safe, and adapts from there.
+TWO GRIPPER AREAS (set in grip_tuner.py)
+    TIP area  - the claw's front end. The robot drives until a gem is a
+                little outside the tip circle (far enough to stop in time),
+                then STOPS, opens the claw, and WAITS for the servo to finish
+                opening. Only then does it move in, and once the gem is
+                inside the tip circle it only creeps. So the claw is open
+                before anything touches it - the tips used to reach the gem
+                while the claw was still closed and shove it.
+    HOLD area - where the gem must be when the claw closes. Arriving means
+                the gem is within PICKUP_DISTANCE of the hold spot; main.py
+                then grabs and checks the gem really is inside the hold circle.
 
-Stuck handling (replaces the old 3-second timer that also fired during
-normal slow turns): the robot counts as stuck only when several pulses in a
-row make NO progress - the angle doesn't improve (e.g. a gem is being
-dragged along by the claw) or hops don't get it closer (e.g. a gem is being
-pushed ahead). Then it either grabs/places anyway if it's close enough, or
-gives up on that target so navigation picks another.
+Pushing: if a creep makes the gem slide forward together with the robot, the
+tip is shoving it. The robot backs up (with the claw still open) and tries
+again; after MAX_PUSHES it gives up on that gem.
+
+Self-calibration: after every pulse/hop the controller measures what really
+happened (degrees turned, pixels driven) and updates its estimate, so later
+moves get the size right. It starts by assuming the robot is FAST, so the
+first moves are short and safe.
+
+Stuck handling is based on progress, not time: several pulses in a row that
+don't improve the angle, or hops that don't get closer, mean stuck. Then it
+takes the gem if it is already close, or gives that target up.
 
 The Arduino firmware is unchanged - this only uses the existing
-FORWARD / BACKWARD / LEFT / RIGHT / STOP commands.
+FORWARD / BACKWARD / LEFT / RIGHT / STOP commands (and asks main.py to send
+RELEASE to open the claw).
 """
 
 import math
@@ -42,6 +53,12 @@ import config
 # ---- timing -------------------------------------------------------------
 SETTLE_SEC = 0.30          # stop this long after each pulse/hop before looking again
 
+# ---- the claw ---------------------------------------------------------------
+OPEN_WAIT_SEC = 0.5        # how long the servo needs to open the claw - raise if it is slow
+STOP_LATENCY_SEC = 0.25    # camera + Wi-Fi delay: stop driving this much travel BEFORE the tip circle
+STOP_MARGIN_LIMITS = (10.0, 70.0)   # px, clamp for that stopping distance
+CREEP_PX = 15.0            # while a gem is inside the tip circle, each hop aims for at most this far
+
 # ---- turning --------------------------------------------------------------
 KEEP_DRIVING_FACTOR = 1.5  # while driving, only stop to re-aim past TURN_ANGLE_THRESHOLD x this
 TURN_GAIN = 0.8            # aim to remove 80% of the angle error per pulse (never overshoot)
@@ -51,21 +68,23 @@ TURN_RATE_START = 240.0    # deg/s assumed at start - deliberately FAST so first
 TURN_RATE_LIMITS = (15.0, 900.0)
 
 # ---- driving --------------------------------------------------------------
-SLOW_ZONE_FACTOR = 3.0     # inside PICKUP_DISTANCE x this, switch from driving to hops
+SLOW_ZONE_FACTOR = 3.0     # bases: inside PICKUP_DISTANCE x this, switch from driving to hops
 HOP_GAIN = 0.7             # each hop covers 70% of the remaining distance
 HOP_MIN_SEC = 0.08
 HOP_MAX_SEC = 0.35
 DRIVE_RATE_START = 400.0   # px/s assumed at start - deliberately FAST so first hops are short
 DRIVE_RATE_LIMITS = (20.0, 2000.0)
 
-# ---- stuck / arrival ------------------------------------------------------
+# ---- stuck / arrival / pushing --------------------------------------------
 STUCK_TURN_TRIES = 6       # this many turn pulses in a row without the angle improving
 STUCK_HOP_TRIES = 6        # this many hops in a row without getting closer
 ANGLE_PROGRESS_DEG = 3.0
 DIST_PROGRESS_PX = 3.0
-OVERSHOOT_PX = 10.0        # final approach: grip spot passed the target by this much
+OVERSHOOT_PX = 10.0        # final approach: hold spot passed the target by this much
 FORCE_ARRIVE_FACTOR = 1.6  # stuck/passed but within PICKUP_DISTANCE x this -> grab/place anyway
 MAX_MISSES = 2             # passed beside the target this many times -> give up on it
+PUSH_MOVE_PX = 8.0         # the gem slid at least this far forward during one hop = being pushed
+MAX_PUSHES = 2             # pushed it this many times -> give up on it
 
 # Close to the target, "lined up" is judged by how far SIDEWAYS the claw's
 # straight path would miss the target, not by angle: 15 degrees is fine from
@@ -94,7 +113,7 @@ class MotionController(border_guard.BorderMixin):
         self.turn_rate = TURN_RATE_START
         self.drive_rate = DRIVE_RATE_START
 
-        self.state = "IDLE"       # IDLE, TURN, DRIVE, HOP, BACKUP, WAIT, SETTLE, ARRIVED
+        self.state = "IDLE"   # IDLE, TURN, DRIVE, HOP, BACKUP, WAIT, OPENING, SETTLE, ARRIVED
         self.command = "STOP"
         self.action_end = 0.0
         self.settle_end = 0.0
@@ -106,10 +125,11 @@ class MotionController(border_guard.BorderMixin):
         self.action_target = None   # target a continuous DRIVE was started for
         self.min_distance_seen = 0.0
         self._border_setup()        # lost-marker recovery + last-move memory (border_guard.py)
+        self.claw_ready = True      # refreshed every update()
         self._reset_target_progress()
 
     # ------------------------------------------------------------------
-    def _reset_target_progress(self, keep_misses=False):
+    def _reset_target_progress(self, keep_misses=False, keep_pushes=False):
         self.best_angle = None
         self.turn_fails = 0
         self.final_approach = False
@@ -117,11 +137,13 @@ class MotionController(border_guard.BorderMixin):
         self.hop_fails = 0
         if not keep_misses:
             self.misses = 0
+        if not keep_pushes:
+            self.pushes = 0
 
     def reset_target(self):
         """Call after a failed grab etc. - forget progress toward the target."""
         self._reset_target_progress()
-        if self.state == "ARRIVED":
+        if self.state in ("ARRIVED", "OPENING"):
             self.state = "IDLE"
 
     def request_backup(self, now, seconds, delay=0.0):
@@ -166,22 +188,52 @@ class MotionController(border_guard.BorderMixin):
             self.drive_rate = _clamp((1 - LEARN_RATE) * self.drive_rate + LEARN_RATE * observed,
                                      *DRIVE_RATE_LIMITS)
 
-    def _stuck(self, distance, why):
-        self.state = "ARRIVED" if distance <= config.PICKUP_DISTANCE * FORCE_ARRIVE_FACTOR else "IDLE"
+    def _out(self, arrived=False, give_up=False, open_now=False):
+        return {"command": self.command, "state": self.state,
+                "arrived": arrived, "give_up": give_up, "open_now": open_now,
+                "note": self.note}
+
+    def _open_claw(self, why, claw_open_since):
+        """Stand still until the claw is open. Asks main.py to send RELEASE
+        whenever it does not know the claw to be open."""
+        self.state = "OPENING"
         self.command = "STOP"
-        if self.state == "ARRIVED":
+        self.note = why
+        return self._out(open_now=(claw_open_since is None))
+
+    def _stuck(self, nav, why, claw_open_since):
+        distance = nav["gripper_distance"]
+        close = distance <= config.PICKUP_DISTANCE * FORCE_ARRIVE_FACTOR
+        if close and self._needs_claw(nav) and not self.claw_ready:
+            return self._open_claw(f"stuck ({why}) but close - opening the claw first", claw_open_since)
+        self.command = "STOP"
+        if close:
+            self.state = "ARRIVED"
             self.note = f"stuck ({why}) but close - taking it here"
             return self._out(arrived=True)
+        self.state = "IDLE"
         self.note = f"stuck ({why}) - giving up on this target"
         self._reset_target_progress()
         return self._out(give_up=True)
 
-    def _out(self, arrived=False, give_up=False):
-        return {"command": self.command, "state": self.state,
-                "arrived": arrived, "give_up": give_up, "note": self.note}
+    @staticmethod
+    def _needs_claw(nav):
+        """Gem targets need the claw open before contact; bases do not."""
+        tid = nav.get("target_id")
+        return bool(tid) and tid[0] == "gem"
+
+    def _far(self, nav):
+        """Still far enough to keep driving continuously?"""
+        if self._needs_claw(nav) and nav.get("tip_distance") is not None:
+            # Stop early enough that the robot (still moving while the stop
+            # command travels through camera + Wi-Fi) halts OUTSIDE the tip
+            # circle, with time to open the claw before anything touches it.
+            margin = _clamp(self.drive_rate * STOP_LATENCY_SEC, *STOP_MARGIN_LIMITS)
+            return nav["tip_distance"] > getattr(config, "GRIPPER_TIP_RADIUS", 30) + margin
+        return nav["gripper_distance"] > config.PICKUP_DISTANCE * SLOW_ZONE_FACTOR
 
     # ------------------------------------------------------------------
-    def _border_denied(self, nav, why):
+    def _border_denied(self, nav, why, claw_open_since):
         """
         The next forward move would carry the robot out of the safe zone (see
         border_guard.py). Either the target is already close enough to take it
@@ -196,6 +248,8 @@ class MotionController(border_guard.BorderMixin):
             reach = max(reach, 0.8 * radius)    # a base is big: the grip spot only has to be ON it
         self.command = "STOP"
         if distance <= reach:
+            if is_gem and not self.claw_ready:
+                return self._open_claw("at the border - opening the claw first", claw_open_since)
             self.state = "ARRIVED"
             self.note = f"at the border - {'taking it' if is_gem else 'placing it'} from here ({why})"
             return self._out(arrived=True)
@@ -204,39 +258,45 @@ class MotionController(border_guard.BorderMixin):
         self._reset_target_progress()
         return self._out(give_up=True)
 
-    def update(self, now, pose, nav, zone=None):
+    def update(self, now, pose, nav, claw_open_since=None, zone=None):
         """
         pose: (x, y, heading_deg) of the robot center, or None if the marker is not seen.
         nav:  the dict from navigation.compute_navigation().
+        claw_open_since: when main.py sent the open command (None = closed / unknown).
         zone: a border_guard.SafeZone (or None = no border): forward/backward moves that
               would end outside it are refused or cut short, and a target that cannot be
               reached without leaving it is given up.
         With pose None the robot does not just stand there: it runs the lost-marker
         recovery (see border_guard.py).
-        Returns {"command", "state", "arrived", "give_up", "note"}.
+        Returns {"command", "state", "arrived", "give_up", "open_now", "note"}.
         """
         if pose is None:
             out = self._lost(now)
         else:
             self._found(now, pose, zone)
-            out = self._update_core(now, pose, nav, zone)
+            out = self._update_core(now, pose, nav, claw_open_since, zone)
         if pose is not None:               # the recovery's own commands are never remembered
             self._record_command(out["command"], now)
         return out
 
-    def _update_core(self, now, pose, nav, zone=None):
+    def _update_core(self, now, pose, nav, claw_open_since=None, zone=None):
         """
         pose: (x, y, heading_deg) of the robot center, or None if not seen.
               heading must include the grip slant (see navigation.py).
         nav:  the dict from navigation.compute_navigation().
-        Returns {"command", "state", "arrived", "give_up", "note"}.
+        claw_open_since: time (same clock as `now`) when main.py sent the open
+              command, or None if the claw is closed / not known to be open.
+        Returns {"command", "state", "arrived", "give_up", "open_now", "note"}.
         """
+
+        self.claw_ready = (claw_open_since is not None
+                           and now >= claw_open_since + OPEN_WAIT_SEC)
 
         has_target = pose is not None and nav["nav_target_point"] is not None
         if has_target and nav["target_id"] != self.target_id:
             self.target_id = nav["target_id"]
             self._reset_target_progress()
-            if self.state == "ARRIVED":
+            if self.state in ("ARRIVED", "OPENING"):
                 self.state = "IDLE"
 
         # ---- finish whatever is in progress ------------------------------
@@ -260,18 +320,47 @@ class MotionController(border_guard.BorderMixin):
 
         if self.state == "DRIVE":
             keep = config.TURN_ANGLE_THRESHOLD * KEEP_DRIVING_FACTOR
-            slow_zone = config.PICKUP_DISTANCE * SLOW_ZONE_FACTOR
             if (has_target and nav["target_id"] == self.action_target
-                    and abs(nav["angle_diff"]) <= keep and nav["gripper_distance"] > slow_zone):
+                    and abs(nav["angle_diff"]) <= keep and self._far(nav)):
                 return self._out()
             self._begin_settle(now)
 
         if self.state == "SETTLE":
             if now < self.settle_end:
                 return self._out()
+            finished = self.action
             self._learn(pose)
             self.state = "IDLE"
             self._border_report(zone, pose)
+
+            # Did that hop push the gem instead of closing in on it?
+            if (has_target and finished is not None and finished["kind"] == "HOP"
+                    and finished.get("gem_point") is not None
+                    and finished.get("target") == nav["target_id"]):
+                gx0, gy0 = finished["gem_point"]
+                dx = nav["nav_target_point"][0] - gx0
+                dy = nav["nav_target_point"][1] - gy0
+                moved = math.hypot(dx, dy)
+                heading = math.radians(pose[2])
+                ahead = dx * math.cos(heading) + dy * math.sin(heading)
+                if moved >= PUSH_MOVE_PX and ahead >= 0.6 * moved:
+                    self.pushes += 1
+                    if self.pushes > MAX_PUSHES:
+                        return self._stuck(nav, "keeps pushing the gem instead of entering it",
+                                           claw_open_since)
+                    back = _clamp((2 * ahead + 15) / self.drive_rate, 0.15, 0.5)
+                    self._reset_target_progress(keep_misses=True, keep_pushes=True)
+                    self._start("BACKUP", "BACKWARD", now, back, None)
+                    self.note = f"pushing the gem ({ahead:.0f}px ahead) - backing up to try again"
+                    return self._out()
+
+        if self.state == "OPENING":
+            if has_target and self.claw_ready:
+                self.state = "IDLE"
+            elif has_target:
+                return self._out(open_now=(claw_open_since is None))
+            else:
+                self.state = "IDLE"
 
         if self.state == "ARRIVED":
             return self._out(arrived=True)
@@ -285,8 +374,11 @@ class MotionController(border_guard.BorderMixin):
 
         angle = nav["angle_diff"]
         distance = nav["gripper_distance"]
+        needs_claw = self._needs_claw(nav)
 
         if distance <= config.PICKUP_DISTANCE:
+            if needs_claw and not self.claw_ready:
+                return self._open_claw("at the gem - opening the claw first", claw_open_since)
             self.state = "ARRIVED"
             self.note = "arrived"
             return self._out(arrived=True)
@@ -297,20 +389,32 @@ class MotionController(border_guard.BorderMixin):
         if self.final_approach and self.min_distance is not None \
                 and distance > self.min_distance + OVERSHOOT_PX:
             if self.min_distance <= config.PICKUP_DISTANCE * FORCE_ARRIVE_FACTOR:
+                if needs_claw and not self.claw_ready:
+                    return self._open_claw("passed just by it - opening the claw first",
+                                           claw_open_since)
                 self.state = "ARRIVED"
                 self.note = "passed just by it - taking it here"
                 return self._out(arrived=True)
             # Went past it without the claw getting close: back up and retry.
             self.misses += 1
             if self.misses > MAX_MISSES:
-                return self._stuck(distance, "keeps passing beside it")
+                return self._stuck(nav, "keeps passing beside it", claw_open_since)
             back = _clamp((distance + config.PICKUP_DISTANCE) / self.drive_rate, 0.15, 0.6)
             self._reset_target_progress(keep_misses=True)
             self._start("BACKUP", "BACKWARD", now, back, None)
             self.note = f"missed it (closest {self.min_distance_seen:.0f}px) - backing up to retry"
             return self._out()
 
-        far = distance > config.PICKUP_DISTANCE * SLOW_ZONE_FACTOR
+        far = self._far(nav)
+
+        # Open the claw BEFORE any more aiming. Turning pivots about the robot's
+        # centre, and the claw tip is ~100px out from it, so even a modest
+        # correction swings the tip sideways by tens of pixels - straight into
+        # the gem if the claw is not open yet (seen in simulation: the tip went
+        # from 68px to 8px away without the robot driving at all).
+        if needs_claw and not far and not self.claw_ready:
+            return self._open_claw("stopped short of the gem - opening the claw", claw_open_since)
+
         if far:
             needs_turn = abs(angle) > config.TURN_ANGLE_THRESHOLD
         else:
@@ -330,7 +434,7 @@ class MotionController(border_guard.BorderMixin):
             else:
                 self.turn_fails += 1
                 if self.turn_fails >= STUCK_TURN_TRIES:
-                    return self._stuck(distance, "turning does not reduce the angle")
+                    return self._stuck(nav, "turning does not reduce the angle", claw_open_since)
 
             duration = _clamp(TURN_GAIN * abs(angle) / self.turn_rate, TURN_MIN_SEC, TURN_MAX_SEC)
             direction = "RIGHT" if angle > 0 else "LEFT"
@@ -349,15 +453,21 @@ class MotionController(border_guard.BorderMixin):
                 if not ok:
                     fitted = self._fit_hop(zone, pose)
                     if fitted is None:
-                        return self._border_denied(nav, why)
+                        return self._border_denied(nav, why, claw_open_since)
                     self._start("HOP", "FORWARD", now, fitted, pose)
                     self.action["fitted"] = True
                     self.note = f"border: little room left - short timed hop {fitted:.2f}s ({why})"
                     return self._out()
             self._start("DRIVE", "FORWARD", now, 0.0, pose)
             self.action_target = nav["target_id"]
-            self.note = f"drive, {distance:.0f}px to go"
+            tip = nav.get("tip_distance")
+            self.note = (f"drive, tip {tip:.0f}px from the gem" if needs_claw and tip is not None
+                         else f"drive, {distance:.0f}px to go")
             return self._out()
+
+        # ---- close: the claw must be OPEN before moving in ----------------
+        if needs_claw and not self.claw_ready:
+            return self._open_claw("stopped short of the gem - opening the claw", claw_open_since)
 
         # ---- lined up and close: short hops, heading locked ----------------
         if self.final_approach:
@@ -366,13 +476,17 @@ class MotionController(border_guard.BorderMixin):
             else:
                 self.hop_fails += 1
                 if self.hop_fails >= STUCK_HOP_TRIES:
-                    return self._stuck(distance, "hops do not get closer")
+                    return self._stuck(nav, "hops do not get closer", claw_open_since)
         self.final_approach = True
         self.min_distance = distance if self.min_distance is None else min(self.min_distance, distance)
         self.min_distance_seen = self.min_distance
 
         remaining = distance - config.PICKUP_DISTANCE * 0.5
-        duration = _clamp(HOP_GAIN * remaining / self.drive_rate, HOP_MIN_SEC, HOP_MAX_SEC)
+        hop_px = HOP_GAIN * remaining
+        creeping = needs_claw and nav.get("in_tip_zone")
+        if creeping:
+            hop_px = min(hop_px, CREEP_PX)   # a gem is inside the tip circle: no big lunges
+        duration = _clamp(hop_px / self.drive_rate, HOP_MIN_SEC, HOP_MAX_SEC)
         fitted = False
         if zone is not None:
             ok, why = zone.allows((pose[0], pose[1]), pose[2], 1,
@@ -380,10 +494,12 @@ class MotionController(border_guard.BorderMixin):
             if not ok:
                 shorter = self._fit_hop(zone, pose)
                 if shorter is None:
-                    return self._border_denied(nav, why)
+                    return self._border_denied(nav, why, claw_open_since)
                 duration, fitted = min(duration, shorter), True
         self._start("HOP", "FORWARD", now, duration, pose)
         if fitted:
             self.action["fitted"] = True
-        self.note = f"hop {duration:.2f}s, {distance:.0f}px to go"
+        self.action["gem_point"] = nav["nav_target_point"]
+        self.action["target"] = nav["target_id"]
+        self.note = f"{'creep' if creeping else 'hop'} {duration:.2f}s, {distance:.0f}px to go"
         return self._out()

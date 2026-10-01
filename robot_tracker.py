@@ -119,3 +119,22 @@ def gripper_center_of(robot_info):
         direction = rotate_vector(direction, angle_offset)
 
     return robot_info["center"] + direction * config.GRIPPER_FORWARD_OFFSET
+
+
+def tip_center_of(robot_info):
+    """
+    Centre of the claw's TIP area: the front end of the claw, a little further
+    along the same (slanted) direction as the grip spot. motion.py uses the
+    distance from here to a gem to decide when the claw must be open.
+    """
+
+    if robot_info["center"] is None or robot_info["forward_unit"] is None:
+        return None
+
+    angle_offset = getattr(config, "GRIPPER_ANGLE_OFFSET_DEG", 0.0)
+    direction = robot_info["forward_unit"]
+    if angle_offset:
+        direction = rotate_vector(direction, angle_offset)
+
+    tip_offset = getattr(config, "GRIPPER_TIP_OFFSET", config.GRIPPER_FORWARD_OFFSET + 25)
+    return robot_info["center"] + direction * tip_offset

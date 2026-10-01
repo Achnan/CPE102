@@ -21,9 +21,15 @@ different headings so the slant is corrected everywhere, not just at one
 angle), then press 's' to save.
 
 Controls:
-    s        - save both values to robot_overrides.json
+    o        - OPEN the claw   (sends RELEASE to the robot)
+    c        - CLOSE the claw  (sends GRAB to the robot)
+    s        - save the values to robot_overrides.json
                (main.py picks them up next time it starts)
     q / ESC  - quit
+
+Use 'o' and 'c' to see where the magenta circle sits on the claw when it is
+open and when it is closed. The screen tells you whether each command really
+reached the robot.
 
 The robot must be in view so its ArUco marker is detected. Don't run
 this at the same time as main.py - only one program can use the camera.
@@ -37,6 +43,7 @@ import cv2
 
 import config
 import drawing
+import esp32_link
 import robot_tracker
 
 ROBOT_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "robot_overrides.json")
@@ -101,6 +108,7 @@ def main():
 
     status = ""
     status_frames_left = 0
+    claw_text, claw_color = "claw: unknown (press o / c)", (200, 200, 200)
 
     while True:
         ret, frame = cap.read()
@@ -140,11 +148,13 @@ def main():
             cv2.putText(result, f"grip spot is {dist:.0f}px from robot center",
                         (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
+        cv2.putText(result, claw_text, (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, claw_color, 2)
+
         if status_frames_left > 0:
             cv2.putText(result, status, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             status_frames_left -= 1
 
-        cv2.putText(result, "s = save   q = quit", (10, result.shape[0] - 15),
+        cv2.putText(result, "o = open claw   c = close claw   s = save   q = quit", (10, result.shape[0] - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
         cv2.imshow(WINDOW, result)
@@ -153,6 +163,14 @@ def main():
 
         if key == ord('q') or key == 27:
             break
+        elif key == ord('o'):
+            ok = esp32_link.send_command("RELEASE", force=True)
+            claw_text, claw_color = (("claw: OPEN command reached the robot", (0, 255, 0)) if ok
+                                     else ("claw: OPEN command FAILED to reach the robot", (0, 0, 255)))
+        elif key == ord('c'):
+            ok = esp32_link.send_command("GRAB", force=True)
+            claw_text, claw_color = (("claw: CLOSE command reached the robot", (0, 255, 0)) if ok
+                                     else ("claw: CLOSE command FAILED to reach the robot", (0, 0, 255)))
         elif key == ord('s'):
             save_values(offset, radius, angle_deg)
             status = "Saved! Restart main.py to apply."

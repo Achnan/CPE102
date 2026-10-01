@@ -136,6 +136,8 @@ PYTHON_SLIDERS = [
     ("Stop Rad", 10, 150, config.STOP_DISTANCE, "STOP_DISTANCE", 1),
     ("Mask Pad", 0, 150, config.ROBOT_MASK_PADDING, "ROBOT_MASK_PADDING", 1),
     ("HeldMin x100", 5, 60, int(config.GEM_COLOR_MIN_RATIO * 100), "GEM_COLOR_MIN_RATIO", 100),
+    # how far past a base's drawn circle a gem still counts as ON the base (x100: 125 = 1.25)
+    ("BaseRim x100", 100, 250, int(round(getattr(config, "BASE_EXCLUDE_MARGIN", 1.25) * 100)), "BASE_EXCLUDE_MARGIN", 100),
     # Manual two-speed drive - main.py pushes whichever of these matches the
     # robot's current phase (not holding a gem vs holding one) to the
     # ESP32's DRIVE_SPEED live, whenever that phase changes. Both are
